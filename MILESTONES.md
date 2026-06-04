@@ -243,8 +243,25 @@ Software recovery attempts (wireless switch command bursts, CMD_RESET on RX
 dongle) did not restore the display. A full PSU power cycle also did not fix
 it, suggesting the bad state was persisted to device flash.
 
-Recovery path: use Lian Li L-Connect 3 on Windows to issue a firmware-level
-display reset (CMD_REBOOT 0x0B on the LCD HID interface).
+Root cause: the corrupted theme index (13+) is stored in the LCD controller's
+flash. On startup the LCD controller firmware loads the bad settings, crashes,
+and stops servicing its USB bulk endpoint. The wireless module is on a separate
+code path and continues to work normally (fan/pump control unaffected).
+
+Recovery path: use Lian Li L-Connect 3 on Windows to reflash the LCD receiver
+firmware (Settings → Firmware → Local Update → select "Receiver"). The firmware
+file for the LCD-S Receiver (v1.2) is available at:
+  AWS:    https://lianli-update-2025.s3.ap-southeast-1.amazonaws.com/FW_0618/lianliH2SRF_1_22
+  Aliyun: https://lianli-update.oss-cn-beijing.aliyuncs.com/FW_0618/lianliH2SRF_1_22
+
+L-Connect 3 has access to a USB bootloader mode on the LCD controller that
+bypasses the crashed application firmware. This cannot be replicated from macOS
+with the current reverse-engineered protocol — the LCD's USB bulk endpoint does
+not service writes when the application firmware has crashed.
+
+Device USB identity: VID=1CBE PID=A034 ("LIANLI / lianli-H2S-1.7")
+DES-CBC key/IV for LCD command protocol: "slv3tuzx" (from lian-li-linux)
+Command codes: CMD_REBOOT=0x0B, CMD_SWITCH_TO_DESKTOP=0x96, CMD_STOP_PLAY=0x7B
 
 `theme_index_max` has been hard-clamped to 12 to prevent recurrence.
 
