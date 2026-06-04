@@ -122,9 +122,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "failsafe_pwm": 160,
     "failsafe_pump_rpm": 2800,
     "theme_index": 0,
-    # Upstream currently clamps to 12, but your testing suggests more themes may
-    # exist. Keep this configurable so theme discovery does not need code edits.
-    "theme_index_max": 31,
+    # Confirmed safe range is 0-12. Indexes 13+ corrupt the device display state
+    # and require a physical USB dongle replug to recover.
+    "theme_index_max": 12,
     "brightness": 80,
     "rotation": 0,
     # Optional upstream heartbeat. Leave off unless you see fallback RPM spikes.
@@ -617,7 +617,7 @@ def load_config(path: str | os.PathLike[str] | None) -> dict[str, Any]:
     cfg["stale_pump_rpm"] = clamp_int(cfg.get("stale_pump_rpm", 1950), PUMP_MIN_RPM, PUMP_MAX_RPM_WATERBLOCK2, "stale_pump_rpm")
     cfg["failsafe_pwm"] = apply_min_pwm(cfg.get("failsafe_pwm", 160), cfg["min_pwm"])
     cfg["failsafe_pump_rpm"] = clamp_int(cfg.get("failsafe_pump_rpm", 2800), PUMP_MIN_RPM, PUMP_MAX_RPM_WATERBLOCK2, "failsafe_pump_rpm")
-    cfg["theme_index_max"] = clamp_int(cfg.get("theme_index_max", 31), 0, 255, "theme_index_max")
+    cfg["theme_index_max"] = clamp_int(cfg.get("theme_index_max", 12), 0, 12, "theme_index_max")
     cfg["theme_index"] = clamp_int(cfg.get("theme_index", 0), 0, cfg["theme_index_max"], "theme_index")
     cfg["brightness"] = clamp_int(cfg.get("brightness", 80), 0, 100, "brightness")
     cfg["rotation"] = clamp_int(cfg.get("rotation", 0), 0, 3, "rotation")
@@ -813,6 +813,10 @@ def run_theme_scan(
     scan_theme_max = clamp_int(max(start, end, cfg["theme_index_max"]), 0, 255, "scan_theme_max")
     target_pwm = apply_min_pwm(interpolate_pwm(35.0, cfg["fan_curve"]), cfg["min_pwm"])
     pump_rpm = resolve_pump_rpm(35.0, cfg)
+    switch_rf = cmd_switch_wireless_theme(master_mac, master_ch, device_mac, rx_type)
+    # Use a local rolling seq so the device doesn't ignore packets where seq
+    # hasn't changed — the original prototype used (seq % 255) + 1 each cycle.
+    scan_seq = seq_index
     for theme in range(start, end + step, step):
         if not running:
             break
@@ -820,19 +824,29 @@ def run_theme_scan(
         scan_cfg["theme_index_max"] = scan_theme_max
         scan_cfg["theme_index"] = clamp_int(theme, 0, scan_theme_max, "theme")
         LOG.info("theme_index=%s", scan_cfg["theme_index"])
-        send_control_packets(
-            tx=tx,
-            master_mac=master_mac,
-            master_ch=master_ch,
-            device_mac=device_mac,
-            device_channel=device_channel,
-            rx_type=rx_type,
-            seq_index=seq_index,
-            target_pwm=target_pwm,
-            pump_rpm=pump_rpm,
-            cfg=scan_cfg,
-        )
-        time.sleep(dwell_s)
+        # Re-send the wireless switch command before each theme so the device
+        # picks up the new theme_index from the subsequent aio_params packet.
+        for _ in range(3):
+            send_rf_frame(tx, switch_rf, device_channel, rx_type)
+            time.sleep(0.002)
+        # Keep sending control packets throughout the dwell period so the device
+        # has multiple chances to apply the theme, matching the main loop cadence.
+        deadline = time.time() + dwell_s
+        while time.time() < deadline and running:
+            send_control_packets(
+                tx=tx,
+                master_mac=master_mac,
+                master_ch=master_ch,
+                device_mac=device_mac,
+                device_channel=device_channel,
+                rx_type=rx_type,
+                seq_index=scan_seq,
+                target_pwm=target_pwm,
+                pump_rpm=pump_rpm,
+                cfg=scan_cfg,
+            )
+            scan_seq = (scan_seq % 255) + 1
+            time.sleep(1.0)
 
 
 def main(argv: list[str] | None = None) -> int:

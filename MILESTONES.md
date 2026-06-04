@@ -154,8 +154,9 @@ Status: helper tooling done; systematic scan not yet run.
 Known:
 
 - `theme_index = 5` currently selected.
-- Upstream clamps to 12, but local config allows probing up to 31.
-- User suspects at least 10 themes, possibly more.
+- Valid range confirmed as 0–12. Indexes 13+ corrupt the device display state
+  and require a physical USB dongle replug to recover. `theme_index_max` is now
+  hard-clamped to 12 in the daemon.
 
 Completed:
 
