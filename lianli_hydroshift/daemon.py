@@ -632,6 +632,26 @@ def write_default_config(path: str | os.PathLike[str]) -> None:
         f.write("\n")
 
 
+def set_theme_in_config(path: str | os.PathLike[str], theme_index: int) -> int:
+    """Update theme_index in the config file in place. Returns the clamped value written."""
+    p = Path(path)
+    if p.exists():
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("config root must be a JSON object")
+    else:
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        p.parent.mkdir(parents=True, exist_ok=True)
+    max_theme = clamp_int(data.get("theme_index_max", DEFAULT_CONFIG["theme_index_max"]), 0, 255, "theme_index_max")
+    clamped = clamp_int(theme_index, 0, max_theme, "theme_index")
+    data["theme_index"] = clamped
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    return clamped
+
+
 def curve_preview(cfg: dict[str, Any]) -> str:
     temps = [28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50]
     parts = []
@@ -823,6 +843,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--scan-themes", nargs=2, type=int, metavar=("START", "END"), help="send theme indexes in sequence for discovery")
     parser.add_argument("--theme-dwell-s", type=float, default=3.0)
+    parser.add_argument("--set-theme", type=int, metavar="N", help="update theme_index in config and exit")
     args = parser.parse_args(argv)
 
     setup_logging(args.log_level)
@@ -831,6 +852,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.write_default_config:
         write_default_config(args.config)
         LOG.info("wrote default config to %s", args.config)
+        return 0
+
+    if args.set_theme is not None:
+        try:
+            written = set_theme_in_config(args.config, args.set_theme)
+            LOG.info("set theme_index=%s in %s", written, args.config)
+        except Exception as exc:
+            LOG.error("failed to set theme: %s", exc)
+            return 1
         return 0
 
     try:

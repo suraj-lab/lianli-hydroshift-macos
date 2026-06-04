@@ -149,13 +149,18 @@ Accepted behavior:
 
 ## Milestone 5 — Theme discovery ⏳
 
-Status: not started beyond selecting theme 5.
+Status: helper tooling done; systematic scan not yet run.
 
 Known:
 
 - `theme_index = 5` currently selected.
 - Upstream clamps to 12, but local config allows probing up to 31.
 - User suspects at least 10 themes, possibly more.
+
+Completed:
+
+- `--set-theme N` CLI flag: updates `theme_index` in config.json and exits. Clamps to `theme_index_max`.
+- `scripts/set-theme.sh <N> [--reload]`: convenience wrapper; `--reload` sends SIGHUP to the running daemon so the change takes effect without a full restart.
 
 Next tasks:
 
@@ -175,7 +180,11 @@ cd ~/Projects/lianli-hydroshift-macos
   - whether it affects LCD/pump head
   - brightness/rotation interactions
 - Add `docs/themes.md` once mapped.
-- Optional: add helper command/script to set theme index without editing JSON.
+- Switch to a discovered theme using the new helper:
+
+```bash
+./scripts/set-theme.sh 7 --reload
+```
 
 ## Milestone 6 — Packaging / hardening ⏳
 

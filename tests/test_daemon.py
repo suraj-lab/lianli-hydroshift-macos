@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from lianli_hydroshift import daemon as d
 
@@ -118,6 +121,48 @@ class DaemonProtocolTests(unittest.TestCase):
         self.assertEqual(d.slew_limit(35, 60, up_step=4, down_step=3), 39)
         self.assertEqual(d.slew_limit(60, 35, up_step=4, down_step=3), 57)
         self.assertEqual(d.slew_limit(35, 37, up_step=4, down_step=3), 37)
+
+
+class SetThemeConfigTests(unittest.TestCase):
+    def _write_config(self, path, data):
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    def test_set_theme_updates_existing_config(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump({"theme_index": 0, "theme_index_max": 31}, f)
+            path = f.name
+        d.set_theme_in_config(path, 7)
+        with open(path) as f:
+            data = json.load(f)
+        self.assertEqual(data["theme_index"], 7)
+        self.assertEqual(data["theme_index_max"], 31)
+
+    def test_set_theme_creates_config_if_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sub" / "config.json"
+            written = d.set_theme_in_config(path, 5)
+            self.assertEqual(written, 5)
+            with open(path) as f:
+                data = json.load(f)
+            self.assertEqual(data["theme_index"], 5)
+
+    def test_set_theme_clamps_to_theme_index_max(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump({"theme_index_max": 12}, f)
+            path = f.name
+        written = d.set_theme_in_config(path, 99)
+        self.assertEqual(written, 12)
+        with open(path) as f:
+            data = json.load(f)
+        self.assertEqual(data["theme_index"], 12)
+
+    def test_set_theme_clamps_negative_to_zero(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump({}, f)
+            path = f.name
+        written = d.set_theme_in_config(path, -3)
+        self.assertEqual(written, 0)
 
 
 if __name__ == "__main__":
