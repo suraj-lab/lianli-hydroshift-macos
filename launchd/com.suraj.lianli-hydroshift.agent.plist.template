@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.suraj.lianli-hydroshift</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>@PYTHON@</string>
+    <string>-u</string>
+    <string>-m</string>
+    <string>lianli_hydroshift.daemon</string>
+    <string>--config</string>
+    <string>@CONFIG@</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>@PROJECT_DIR@</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>PYTHONDONTWRITEBYTECODE</key>
+    <string>1</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>ProcessType</key>
+  <string>Standard</string>
+
+  <key>Nice</key>
+  <integer>-5</integer>
+
+  <key>StandardOutPath</key>
+  <string>@STDOUT_LOG@</string>
+
+  <key>StandardErrorPath</key>
+  <string>@STDERR_LOG@</string>
+</dict>
+</plist>
