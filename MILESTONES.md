@@ -232,6 +232,22 @@ Likely next steps:
 3. Prototype one static RGB command from this daemon or a separate test script.
 4. Only then consider OpenRGB integration.
 
+## Display recovery incident (2026-06-04)
+
+Theme scan probed index 13 which corrupted the AIO display state. The display
+now shows the Lian Li logo and hardware temp overlay simultaneously (hardware
+monitoring mode) instead of the wireless theme. Fan/pump control and telemetry
+are completely unaffected — the daemon is running normally.
+
+Software recovery attempts (wireless switch command bursts, CMD_RESET on RX
+dongle) did not restore the display. A full PSU power cycle also did not fix
+it, suggesting the bad state was persisted to device flash.
+
+Recovery path: use Lian Li L-Connect 3 on Windows to issue a firmware-level
+display reset (CMD_REBOOT 0x0B on the LCD HID interface).
+
+`theme_index_max` has been hard-clamped to 12 to prevent recurrence.
+
 ## Known issues / observations
 
 - RX telemetry can be noisy under heavy CPU load and sometimes reports implausibly low coolant values.

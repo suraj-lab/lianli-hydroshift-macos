@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Send repeated wireless-switch commands to recover a corrupted AIO display state.
 
-If the RX dongle can't be read (device in bad state), falls back to sweeping
-common channel/rx_type combinations using the TX master MAC alone.
+Uses TX-only mode: skips RX collection entirely to avoid the RX I/O error
+corrupting the shared libusb context. Falls back to last-known device details
+from daemon logs if RX discovery is unavailable.
 """
 
 import sys
@@ -12,21 +13,50 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 
 from lianli_hydroshift.daemon import (
     TX_IDS, RX_IDS,
-    claim, release, discover_master, collect_rx_frames, find_aio,
+    claim, release, get_endpoints, discover_master, collect_rx_frames, find_aio,
     cmd_switch_wireless_theme, send_rf_frame,
     USB_ERROR,
 )
 
-REPEATS = 50
-REPEAT_DELAY = 0.05
+# Last-known device details from daemon logs — used when RX is unreadable.
+KNOWN_DEVICE_MAC = bytes.fromhex("2da374e566e1")
+KNOWN_DEVICE_CHANNEL = 8
+KNOWN_RX_TYPE = 1
+
+REPEATS = 200
+REPEAT_DELAY = 0.02
 
 
 def send_switch(tx, switch_rf, channel, rx_type, repeats: int = REPEATS) -> None:
     for i in range(repeats):
         send_rf_frame(tx, switch_rf, channel, rx_type)
         time.sleep(REPEAT_DELAY)
-        if (i + 1) % 10 == 0:
+        if (i + 1) % 50 == 0:
             print(f"  {i + 1}/{repeats}", flush=True)
+
+
+def try_reset_rx(rx) -> None:
+    """Send CMD_RESET to the RX dongle to clear its wireless state."""
+    try:
+        out_ep, _ = get_endpoints(rx)
+        cmd = bytearray(64)
+        cmd[0] = 0x11  # USB_CMD_GET_MAC envelope
+        cmd[1] = 0x08  # reset sub-command (from lian-li-linux CMD_RESET)
+        rx.write(out_ep, bytes(cmd), 1000)
+        time.sleep(0.1)
+        print("RX reset command sent.")
+    except Exception as exc:
+        print(f"RX reset failed ({exc}); continuing anyway")
+
+
+def try_rx_discovery(rx, master_mac):
+    """Attempt RX device discovery. Returns record or None — never raises."""
+    try:
+        frames = collect_rx_frames(rx, count=5, max_wait=5.0)
+        return find_aio(frames, master_mac=master_mac)
+    except Exception as exc:
+        print(f"RX collection failed ({exc}); using last-known device details")
+        return None
 
 
 def main() -> int:
@@ -36,47 +66,57 @@ def main() -> int:
         print("ERROR: pyusb not installed. Run: pip install -r requirements.txt", file=sys.stderr)
         return 1
 
-    tx = rx = None
+    # --- TX only first ---
+    tx = None
     try:
-        tx = next((usb_core.find(idVendor=v, idProduct=p) for v, p in TX_IDS if usb_core.find(idVendor=v, idProduct=p)), None)
-        rx = next((usb_core.find(idVendor=v, idProduct=p) for v, p in RX_IDS if usb_core.find(idVendor=v, idProduct=p)), None)
-        if tx is None or rx is None:
-            print(f"ERROR: dongles not found (tx={bool(tx)} rx={bool(rx)})", file=sys.stderr)
+        for vid, pid in TX_IDS:
+            tx = usb_core.find(idVendor=vid, idProduct=pid)
+            if tx:
+                break
+        if tx is None:
+            print("ERROR: TX dongle not found", file=sys.stderr)
             return 1
 
         claim(tx)
-        claim(rx)
-
         master_mac, master_ch = discover_master(tx)
         if master_mac is None:
             print("ERROR: TX dongle did not respond to GET_MAC scan", file=sys.stderr)
             return 1
         print(f"master: {master_mac.hex(':')}  ch={master_ch}")
 
-        # Try to discover device via RX — may fail if device is in a bad state.
+        # --- Try RX in its own isolated block; release before using TX ---
+        rx = None
         rec = None
         try:
-            frames = collect_rx_frames(rx, count=5, max_wait=5.0)
-            rec = find_aio(frames, master_mac=master_mac)
-        except (USB_ERROR, Exception) as exc:
-            print(f"RX collection failed ({exc}); falling back to channel sweep")
+            for vid, pid in RX_IDS:
+                rx = usb_core.find(idVendor=vid, idProduct=pid)
+                if rx:
+                    break
+            if rx:
+                claim(rx)
+                try_reset_rx(rx)
+                rec = try_rx_discovery(rx, master_mac)
+        except Exception as exc:
+            print(f"RX setup failed ({exc}); using last-known device details")
+        finally:
+            # Release RX before touching TX so a bad RX state can't corrupt TX.
+            release(rx, "RX")
+            rx = None
 
         if rec is not None:
-            print(f"device: {rec['mac'].hex(':')}  ch={rec['channel']}  rx={rec['rx_type']}")
-            switch_rf = cmd_switch_wireless_theme(master_mac, master_ch, rec["mac"], rec["rx_type"])
-            print(f"Sending {REPEATS}x wireless switch on known channel {rec['channel']}...", flush=True)
-            send_switch(tx, switch_rf, rec["channel"], rec["rx_type"])
+            device_mac = rec["mac"]
+            device_ch = rec["channel"]
+            rx_type = rec["rx_type"]
+            print(f"device (discovered): {device_mac.hex(':')}  ch={device_ch}  rx={rx_type}")
         else:
-            # Device MAC unknown — sweep the most common channel/rx_type pairs.
-            # Use a broadcast-style placeholder MAC (all zeros means the dongle
-            # may forward to any paired device on that channel).
-            print("Device not discoverable; sweeping common channels with null MAC...", flush=True)
-            null_mac = b"\x00" * 6
-            for channel in [8, 6, 10, 4, 12, 2, 14]:
-                for rx_type in [2, 1, 3]:
-                    switch_rf = cmd_switch_wireless_theme(master_mac, master_ch, null_mac, rx_type)
-                    print(f"  ch={channel} rx_type={rx_type}", flush=True)
-                    send_switch(tx, switch_rf, channel, rx_type, repeats=10)
+            device_mac = KNOWN_DEVICE_MAC
+            device_ch = KNOWN_DEVICE_CHANNEL
+            rx_type = KNOWN_RX_TYPE
+            print(f"device (last-known): {device_mac.hex(':')}  ch={device_ch}  rx={rx_type}")
+
+        switch_rf = cmd_switch_wireless_theme(master_mac, master_ch, device_mac, rx_type)
+        print(f"Sending {REPEATS}x wireless switch commands...", flush=True)
+        send_switch(tx, switch_rf, device_ch, rx_type)
 
         print("\nDone. Restart the daemon to resume normal control:")
         print("  sudo launchctl kickstart -k system/com.suraj.lianli-hydroshift")
@@ -84,7 +124,6 @@ def main() -> int:
 
     finally:
         release(tx, "TX")
-        release(rx, "RX")
 
 
 if __name__ == "__main__":
