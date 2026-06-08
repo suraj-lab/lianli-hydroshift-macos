@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import ctypes
+import ctypes.util
 import json
 import logging
 import os
@@ -17,7 +19,9 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
+
+from .openrgb import OpenRgbBridge, OpenRgbDevice, OpenRgbZone
 
 try:
     import usb.core as usb_core
@@ -43,6 +47,7 @@ RF_SELECT = 0x12
 RF_PWM_CMD = 0x10
 RF_MASTER_CLOCK = 0x14
 RF_AIO_SWITCH_WIRELESS = 0x19
+RF_SET_RGB = 0x20
 RF_AIO_PARAMS = 0x21
 RF_DATA_SIZE = 240
 RF_CHUNK_SIZE = 60
@@ -129,10 +134,30 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "rotation": 0,
     # Optional upstream heartbeat. Leave off unless you see fallback RPM spikes.
     "send_master_clock": False,
+    # Optional OpenRGB SDK bridge. When enabled, OpenRGB connects to this daemon
+    # over TCP; the daemon remains the sole owner of the Lian Li USB/RF path.
+    "openrgb_server": False,
+    "openrgb_host": "127.0.0.1",
+    "openrgb_port": 6743,
+    # Path to a tinyuz shared library exposing tuz_compress_mem(). If empty,
+    # the daemon also checks LIANLI_TINYUZ_LIB and common local library paths.
+    "tinyuz_library": "",
+    # Keep the LaunchDaemon alive across transient USB/dongle/AIO discovery
+    # failures instead of letting launchd restart it every ~30 seconds.
+    "discovery_retry_interval_s": 30.0,
+    "usb_error_reconnect_threshold": 3,
 }
 
 running = True
 reload_requested = False
+
+
+class DiscoveryError(RuntimeError):
+    """Recoverable failure while finding the wireless AIO path."""
+
+
+class ReconnectRequested(RuntimeError):
+    """Recoverable control-loop failure that should reopen USB handles."""
 
 
 def require_usb() -> None:
@@ -397,6 +422,56 @@ def find_aio(frames: list[bytes], master_mac: bytes | None = None) -> dict[str, 
     return None
 
 
+def discovery_summary(frames: list[bytes], master_mac: bytes | None) -> str:
+    records: list[dict[str, Any]] = []
+    for frame in frames:
+        records.extend(parse_frame_records(frame))
+    bound_count = sum(1 for rec in records if master_mac is None or rec["master_mac"] == master_mac)
+    device_types = sorted({rec["device_type"] for rec in records})
+    return f"frames={len(frames)} records={len(records)} bound={bound_count} device_types={device_types}"
+
+
+def connect_hydroshift() -> tuple[Any, Any, dict[str, Any]]:
+    """Open USB dongles and locate the bound HydroShift AIO.
+
+    All failures here are recoverable for a daemon: the dongle may still be
+    enumerating, the AIO may not have advertised yet, or macOS/libusb may have
+    stale handles after sleep/replug. Release partial handles before raising so
+    the next retry starts from a clean libusb state.
+    """
+    tx = rx = None
+    try:
+        tx = find_dongle(TX_IDS)
+        rx = find_dongle(RX_IDS)
+        if tx is None or rx is None:
+            raise DiscoveryError(f"Lian Li wireless dongles not found (tx={bool(tx)} rx={bool(rx)})")
+        claim(tx)
+        claim(rx)
+
+        master_mac, master_ch = discover_master(tx)
+        if master_mac is None or master_ch is None:
+            raise DiscoveryError("TX dongle did not respond to GET_MAC scan")
+        LOG.info("master: %s ch=%s", master_mac.hex(":"), master_ch)
+
+        frames = collect_rx_frames(rx, count=5, max_wait=5.0)
+        rec = find_aio(frames, master_mac=master_mac)
+        if rec is None:
+            raise DiscoveryError(
+                "no bound HydroShift/WaterBlock AIO device found "
+                f"({discovery_summary(frames, master_mac)})"
+            )
+
+        return tx, rx, {
+            "master_mac": master_mac,
+            "master_ch": master_ch,
+            "record": rec,
+        }
+    except Exception:
+        release(tx, "TX")
+        release(rx, "RX")
+        raise
+
+
 # ---------- RF commands ----------
 
 
@@ -469,6 +544,194 @@ def send_master_clock(tx, master_mac: bytes, master_ch: int) -> None:
     rf[1] = RF_MASTER_CLOCK
     rf[8:14] = master_mac
     send_rf_chunks(tx, bytes(rf), packet_channel=master_ch, packet_rx_type=0xFF)
+
+
+# ---------- Wireless RGB / OpenRGB bridge helpers ----------
+
+
+TinyuzCompressor = Callable[[bytes], bytes]
+_TINYUZ_CACHE: dict[str, Any] = {}
+
+
+def effect_index_from_colors(colors: list[tuple[int, int, int]]) -> bytes:
+    """Stable 4-byte effect index matching lian-li-linux's FNV-1a helper."""
+    h = 0x811C9DC5
+    for r, g, b in colors:
+        for value in (r, g, b):
+            h ^= int(value) & 0xFF
+            h = (h * 0x01000193) & 0xFFFFFFFF
+    if h == 0:
+        h = 1
+    return h.to_bytes(4, "big")
+
+
+def tinyuz_candidates(configured_path: str = "") -> list[str]:
+    candidates: list[str] = []
+    for path in (configured_path, os.environ.get("LIANLI_TINYUZ_LIB", "")):
+        if path:
+            candidates.append(os.path.expanduser(path))
+    local_dir = Path(__file__).resolve().parent
+    candidates.extend(
+        str(p)
+        for p in (
+            local_dir / "libtinyuz.dylib",
+            local_dir / "vendor" / "libtinyuz.dylib",
+            Path.cwd() / "libtinyuz.dylib",
+            Path("/usr/local/lib/libtinyuz.dylib"),
+            Path("/opt/homebrew/lib/libtinyuz.dylib"),
+        )
+    )
+    found = ctypes.util.find_library("tinyuz")
+    if found:
+        candidates.append(found)
+    # Preserve order while dropping duplicates.
+    return list(dict.fromkeys(candidates))
+
+
+def load_tinyuz_library(configured_path: str = ""):
+    errors: list[str] = []
+    for path in tinyuz_candidates(configured_path):
+        if path in _TINYUZ_CACHE:
+            return _TINYUZ_CACHE[path]
+        try:
+            lib = ctypes.CDLL(path)
+            lib.tuz_max_compressed_size.argtypes = [ctypes.c_size_t]
+            lib.tuz_max_compressed_size.restype = ctypes.c_size_t
+            lib.tuz_compress_mem.argtypes = [
+                ctypes.POINTER(ctypes.c_ubyte),
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_ubyte),
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+            ]
+            lib.tuz_compress_mem.restype = ctypes.c_size_t
+            _TINYUZ_CACHE[path] = lib
+            LOG.info("loaded tinyuz compressor: %s", path)
+            return lib
+        except OSError as exc:
+            errors.append(f"{path}: {exc}")
+    raise RuntimeError(
+        "tinyuz compressor library not found; set tinyuz_library in config or LIANLI_TINYUZ_LIB. "
+        + "; ".join(errors[:3])
+    )
+
+
+def tinyuz_compress(data: bytes, configured_path: str = "") -> bytes:
+    if not data:
+        raise ValueError("tinyuz cannot compress empty input")
+    lib = load_tinyuz_library(configured_path)
+    max_size = int(lib.tuz_max_compressed_size(len(data)))
+    if max_size <= 0:
+        raise RuntimeError("tinyuz returned invalid max compressed size")
+    in_buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+    out_buf = (ctypes.c_ubyte * max_size)()
+    out_len = int(lib.tuz_compress_mem(in_buf, len(data), out_buf, max_size, 4096))
+    if out_len <= 0 or out_len > max_size:
+        raise RuntimeError("tinyuz compression failed")
+    return bytes(out_buf[:out_len])
+
+
+def build_rgb_direct_frames(
+    *,
+    master_mac: bytes,
+    device_mac: bytes,
+    colors: list[tuple[int, int, int]],
+    effect_index: bytes | None = None,
+    compressor: TinyuzCompressor | None = None,
+    interval_ms: int = 5000,
+) -> list[bytes]:
+    if len(master_mac) != 6 or len(device_mac) != 6:
+        raise ValueError("master_mac and device_mac must be 6 bytes")
+    if not colors:
+        raise ValueError("at least one RGB LED color is required")
+    if len(colors) > 255:
+        raise ValueError("wireless RGB protocol supports at most 255 LEDs per direct frame")
+    compressor = compressor or tinyuz_compress
+    raw_rgb = bytes(max(0, min(255, int(v))) for color in colors for v in color)
+    compressed = compressor(raw_rgb)
+    if not compressed:
+        raise RuntimeError("RGB compressor returned empty payload")
+
+    effect = effect_index or effect_index_from_colors(colors)
+    if len(effect) != 4:
+        raise ValueError("effect_index must be 4 bytes")
+
+    chunk_size = 220
+    total_payload_packets = (len(compressed) + chunk_size - 1) // chunk_size
+    if total_payload_packets > 254:
+        raise ValueError("compressed RGB payload is too large for RF packet counter")
+
+    frames: list[bytes] = []
+    offset = 0
+    packet_index = 0
+    while offset < len(compressed) or packet_index == 0:
+        rf = bytearray(RF_DATA_SIZE)
+        rf[0] = RF_SELECT
+        rf[1] = RF_SET_RGB
+        rf[2:8] = device_mac
+        rf[8:14] = master_mac
+        rf[14:18] = effect
+        rf[18] = packet_index
+        rf[19] = total_payload_packets + 1
+
+        if packet_index == 0:
+            data_len = len(compressed)
+            rf[20] = (data_len >> 24) & 0xFF
+            rf[21] = (data_len >> 16) & 0xFF
+            rf[22] = (data_len >> 8) & 0xFF
+            rf[23] = data_len & 0xFF
+            rf[24] = 0
+            rf[25] = 0
+            rf[26] = 1  # one direct frame
+            rf[27] = len(colors)
+            rf[32] = (interval_ms >> 8) & 0xFF
+            rf[33] = interval_ms & 0xFF
+        else:
+            chunk = compressed[offset : offset + chunk_size]
+            rf[20 : 20 + len(chunk)] = chunk
+            offset += len(chunk)
+
+        frames.append(bytes(rf))
+        packet_index += 1
+    return frames
+
+
+def send_rgb_direct(
+    tx,
+    *,
+    master_mac: bytes,
+    device_mac: bytes,
+    device_channel: int,
+    rx_type: int,
+    colors: list[tuple[int, int, int]],
+    tinyuz_library: str = "",
+) -> None:
+    frames = build_rgb_direct_frames(
+        master_mac=master_mac,
+        device_mac=device_mac,
+        colors=colors,
+        compressor=lambda raw: tinyuz_compress(raw, tinyuz_library),
+    )
+    for idx, rf in enumerate(frames):
+        repeats = 2 if idx == 0 else 1
+        for repeat in range(repeats):
+            send_rf_frame(tx, rf, device_channel, rx_type)
+            if repeat < repeats - 1:
+                time.sleep(0.002)
+
+
+def openrgb_device_from_record(rec: dict[str, Any]) -> OpenRgbDevice:
+    device_type = int(rec.get("device_type", DEVICE_TYPE_WATERBLOCK2))
+    fan_count = max(0, min(4, int(rec.get("fan_count", 0))))
+    name = "HydroShift II LCD-C (Wireless)" if device_type == DEVICE_TYPE_WATERBLOCK else "HydroShift II LCD-S (Wireless)"
+    zones = [OpenRgbZone("Pump Head", 24)]
+    zones.extend(OpenRgbZone(f"Fan {idx + 1}", 24) for idx in range(fan_count))
+    return OpenRgbDevice(
+        name=name,
+        vendor="Lian Li",
+        serial=rec["mac"].hex(":"),
+        zones=zones,
+    )
 
 
 # ---------- Pump / AIO parameter block ----------
@@ -622,6 +885,22 @@ def load_config(path: str | os.PathLike[str] | None) -> dict[str, Any]:
     cfg["brightness"] = clamp_int(cfg.get("brightness", 80), 0, 100, "brightness")
     cfg["rotation"] = clamp_int(cfg.get("rotation", 0), 0, 3, "rotation")
     cfg["send_master_clock"] = bool(cfg.get("send_master_clock", False))
+    cfg["openrgb_server"] = bool(cfg.get("openrgb_server", False))
+    cfg["openrgb_host"] = str(cfg.get("openrgb_host", "127.0.0.1") or "127.0.0.1")
+    cfg["openrgb_port"] = clamp_int(cfg.get("openrgb_port", 6743), 1024, 65535, "openrgb_port")
+    cfg["tinyuz_library"] = str(cfg.get("tinyuz_library", "") or "")
+    cfg["discovery_retry_interval_s"] = clamp_float(
+        cfg.get("discovery_retry_interval_s", 30.0),
+        2.0,
+        300.0,
+        "discovery_retry_interval_s",
+    )
+    cfg["usb_error_reconnect_threshold"] = clamp_int(
+        cfg.get("usb_error_reconnect_threshold", 3),
+        1,
+        25,
+        "usb_error_reconnect_threshold",
+    )
     return cfg
 
 
@@ -762,6 +1041,12 @@ def setup_logging(level: str) -> None:
     )
 
 
+def sleep_interruptible(seconds: float) -> None:
+    deadline = time.time() + max(0.0, float(seconds))
+    while running and time.time() < deadline:
+        time.sleep(min(1.0, deadline - time.time()))
+
+
 def send_control_packets(
     *,
     tx,
@@ -889,152 +1174,52 @@ def main(argv: list[str] | None = None) -> int:
     LOG.info("curve preview: %s", curve_preview(cfg))
     LOG.info("theme=%s brightness=%s rotation=%s", cfg["theme_index"], cfg["brightness"], cfg["rotation"])
 
-    tx = rx = None
-    try:
-        tx = find_dongle(TX_IDS)
-        rx = find_dongle(RX_IDS)
-        if tx is None or rx is None:
-            LOG.error("Lian Li wireless dongles not found (tx=%s rx=%s)", bool(tx), bool(rx))
-            return 1
-        claim(tx)
-        claim(rx)
-
-        master_mac, master_ch = discover_master(tx)
-        if master_mac is None or master_ch is None:
-            LOG.error("TX dongle did not respond to GET_MAC scan")
-            return 1
-        LOG.info("master: %s ch=%s", master_mac.hex(":"), master_ch)
-
-        frames = collect_rx_frames(rx, count=5, max_wait=5.0)
-        rec = find_aio(frames, master_mac=master_mac)
-        if rec is None:
-            LOG.error("no bound HydroShift/WaterBlock AIO device found")
-            return 1
-
-        device_mac = rec["mac"]
-        device_channel = rec["channel"]
-        rx_type = rec["rx_type"]
-        seq_index = rec.get("seq_index", 1)
-        last_raw_coolant = float(rec["coolant_temp"]) if rec["coolant_temp"] is not None else None
-        last_coolant = last_raw_coolant
-        last_good_telemetry = time.time() if last_coolant is not None else 0.0
-        LOG.info(
-            "device: %s ch=%s rx=%s seq=%s coolant=%sC rpm=%s pwm=%s",
-            device_mac.hex(":"),
-            device_channel,
-            rx_type,
-            seq_index,
-            last_coolant,
-            rec["fan_rpms"],
-            rec["current_pwm"],
-        )
-
-        LOG.info("engaging wireless theme mode")
-        switch_rf = cmd_switch_wireless_theme(master_mac, master_ch, device_mac, rx_type)
-        for _ in range(10):
-            send_rf_frame(tx, switch_rf, device_channel, rx_type)
-            time.sleep(0.002)
-        LOG.info("wireless theme mode engaged")
-
-        if args.scan_themes:
-            start, end = args.scan_themes
-            run_theme_scan(
-                tx=tx,
-                master_mac=master_mac,
-                master_ch=master_ch,
-                device_mac=device_mac,
-                device_channel=device_channel,
-                rx_type=rx_type,
-                seq_index=seq_index,
-                cfg=cfg,
-                start=start,
-                end=end,
-                dwell_s=max(0.5, args.theme_dwell_s),
-            )
-            return 0
-
-        LOG.info("entering control loop")
-        last_log = 0.0
-        last_target_pwm: int | None = None
-        last_pump_rpm: int | None = None
-        last_tel: dict[str, Any] | None = rec
-
-        global reload_requested
-        while running:
-            loop_start = time.time()
-
+    global reload_requested
+    while running:
+        tx = rx = None
+        openrgb_bridge: OpenRgbBridge | None = None
+        try:
             if reload_requested:
                 try:
                     cfg = load_config(args.config)
-                    LOG.info("config reloaded: %s", curve_preview(cfg))
+                    LOG.info("config reloaded before discovery: %s", curve_preview(cfg))
                 except Exception as exc:
                     LOG.warning("config reload failed, keeping previous config: %s", exc)
                 reload_requested = False
 
-            frames = collect_rx_frames(rx, count=2, max_wait=1.5)
-            tel = find_aio(frames, master_mac=master_mac)
-            if tel is not None:
-                last_tel = tel
-                device_channel = tel["channel"]
-                rx_type = tel["rx_type"]
-                seq_index = tel.get("seq_index", seq_index)
-                if tel["coolant_temp"] is not None:
-                    raw_coolant = float(tel["coolant_temp"])
-                    current_stale_age = time.time() - last_good_telemetry if last_good_telemetry else 0.0
-                    rejection = coolant_rejection_reason(raw_coolant, last_coolant, cfg, current_stale_age)
-                    if rejection is None:
-                        last_raw_coolant = raw_coolant
-                        last_coolant = filter_coolant_reading(raw_coolant, last_coolant, cfg)
-                        last_good_telemetry = time.time()
-                    else:
-                        LOG.warning("discarding implausible coolant telemetry: %.1fC (%s)", raw_coolant, rejection)
-            else:
-                LOG.warning("no fresh telemetry; using previous state")
+            tx, rx, session = connect_hydroshift()
+            master_mac = session["master_mac"]
+            master_ch = session["master_ch"]
+            rec = session["record"]
 
-            stale_age = time.time() - last_good_telemetry if last_good_telemetry else float("inf")
-            if last_coolant is None or stale_age > cfg["telemetry_hard_stale_s"]:
-                telemetry_state = "hard_stale"
-            elif stale_age > cfg["telemetry_soft_stale_s"]:
-                telemetry_state = "soft_stale"
-            else:
-                telemetry_state = "ok"
-            failsafe = telemetry_state == "hard_stale"
+            device_mac = rec["mac"]
+            device_channel = rec["channel"]
+            rx_type = rec["rx_type"]
+            seq_index = rec.get("seq_index", 1)
+            last_raw_coolant = float(rec["coolant_temp"]) if rec["coolant_temp"] is not None else None
+            last_coolant = last_raw_coolant
+            last_good_telemetry = time.time() if last_coolant is not None else 0.0
+            LOG.info(
+                "device: %s ch=%s rx=%s seq=%s coolant=%sC rpm=%s pwm=%s",
+                device_mac.hex(":"),
+                device_channel,
+                rx_type,
+                seq_index,
+                last_coolant,
+                rec["fan_rpms"],
+                rec["current_pwm"],
+            )
 
-            if telemetry_state == "hard_stale":
-                target_pwm = max(last_target_pwm or 0, cfg["failsafe_pwm"])
-                pump_rpm = max(last_pump_rpm or 0, cfg["failsafe_pump_rpm"])
-            elif telemetry_state == "soft_stale":
-                target_pwm, pump_rpm = stale_targets(last_coolant, last_target_pwm, last_pump_rpm, cfg)
-            else:
-                desired_pwm = apply_min_pwm(interpolate_pwm(float(last_coolant), cfg["fan_curve"]), cfg["min_pwm"])
-                if last_target_pwm is not None and abs(desired_pwm - last_target_pwm) < cfg["pwm_hysteresis"]:
-                    target_pwm = last_target_pwm
-                else:
-                    target_pwm = desired_pwm
+            LOG.info("engaging wireless theme mode")
+            switch_rf = cmd_switch_wireless_theme(master_mac, master_ch, device_mac, rx_type)
+            for _ in range(10):
+                send_rf_frame(tx, switch_rf, device_channel, rx_type)
+                time.sleep(0.002)
+            LOG.info("wireless theme mode engaged")
 
-                desired_pump = resolve_pump_rpm(float(last_coolant), cfg)
-                if last_pump_rpm is not None and abs(desired_pump - last_pump_rpm) < cfg["rpm_hysteresis"]:
-                    pump_rpm = last_pump_rpm
-                else:
-                    pump_rpm = desired_pump
-
-            if last_target_pwm is not None:
-                target_pwm = slew_limit(
-                    last_target_pwm,
-                    target_pwm,
-                    up_step=cfg["pwm_ramp_up_per_tick"],
-                    down_step=cfg["pwm_ramp_down_per_tick"],
-                )
-            if last_pump_rpm is not None:
-                pump_rpm = slew_limit(
-                    last_pump_rpm,
-                    pump_rpm,
-                    up_step=cfg["rpm_ramp_up_per_tick"],
-                    down_step=cfg["rpm_ramp_down_per_tick"],
-                )
-
-            try:
-                send_control_packets(
+            if args.scan_themes:
+                start, end = args.scan_themes
+                run_theme_scan(
                     tx=tx,
                     master_mac=master_mac,
                     master_ch=master_ch,
@@ -1042,43 +1227,219 @@ def main(argv: list[str] | None = None) -> int:
                     device_channel=device_channel,
                     rx_type=rx_type,
                     seq_index=seq_index,
-                    target_pwm=target_pwm,
-                    pump_rpm=pump_rpm,
                     cfg=cfg,
+                    start=start,
+                    end=end,
+                    dwell_s=max(0.5, args.theme_dwell_s),
                 )
-                last_target_pwm = target_pwm
-                last_pump_rpm = pump_rpm
-            except Exception as exc:
-                LOG.warning("sending control packets failed: %s", exc)
+                return 0
 
-            if time.time() - last_log >= cfg["log_interval_s"]:
-                rpm = last_tel["fan_rpms"] if last_tel else [0, 0, 0, 0]
-                LOG.info(
-                    "coolant=%.1fC raw=%sC stale=%.1fs telemetry=%s failsafe=%s fan_pwm=%s/%s pump_target=%srpm rpm=%s",
-                    last_coolant if last_coolant is not None else -1.0,
-                    f"{last_raw_coolant:.1f}" if last_raw_coolant is not None else "n/a",
-                    stale_age,
-                    telemetry_state,
-                    failsafe,
-                    target_pwm,
-                    255,
-                    pump_rpm,
-                    rpm,
+            if cfg["openrgb_server"]:
+                openrgb_bridge = OpenRgbBridge(
+                    openrgb_device_from_record(rec),
+                    host=cfg["openrgb_host"],
+                    port=cfg["openrgb_port"],
                 )
-                last_log = time.time()
+                openrgb_bridge.start()
 
-            elapsed = time.time() - loop_start
-            sleep_for = cfg["keepalive_interval_s"] - elapsed
-            if sleep_for > 0:
-                time.sleep(sleep_for)
+            LOG.info("entering control loop")
+            last_log = 0.0
+            last_target_pwm: int | None = None
+            last_pump_rpm: int | None = None
+            last_tel: dict[str, Any] | None = rec
+            usb_failures = 0
 
-    finally:
-        release(tx, "TX")
-        release(rx, "RX")
-        LOG.info("goodbye")
+            while running:
+                loop_start = time.time()
 
+                if reload_requested:
+                    try:
+                        cfg = load_config(args.config)
+                        LOG.info("config reloaded: %s", curve_preview(cfg))
+                        if openrgb_bridge is not None and not cfg["openrgb_server"]:
+                            openrgb_bridge.stop()
+                            openrgb_bridge = None
+                        elif openrgb_bridge is None and cfg["openrgb_server"]:
+                            openrgb_bridge = OpenRgbBridge(
+                                openrgb_device_from_record(rec),
+                                host=cfg["openrgb_host"],
+                                port=cfg["openrgb_port"],
+                            )
+                            openrgb_bridge.start()
+                    except Exception as exc:
+                        LOG.warning("config reload failed, keeping previous config: %s", exc)
+                    reload_requested = False
+
+                read_failed = False
+                try:
+                    frames = collect_rx_frames(rx, count=2, max_wait=1.5)
+                except (USB_ERROR, RuntimeError, OSError) as exc:
+                    read_failed = True
+                    usb_failures += 1
+                    LOG.warning(
+                        "telemetry USB read failed (%s/%s): %s",
+                        usb_failures,
+                        cfg["usb_error_reconnect_threshold"],
+                        exc,
+                    )
+                    if usb_failures >= cfg["usb_error_reconnect_threshold"]:
+                        raise ReconnectRequested("telemetry USB path failed repeatedly") from exc
+                    frames = []
+
+                tel = find_aio(frames, master_mac=master_mac)
+                if tel is not None:
+                    last_tel = tel
+                    device_channel = tel["channel"]
+                    rx_type = tel["rx_type"]
+                    seq_index = tel.get("seq_index", seq_index)
+                    if tel["coolant_temp"] is not None:
+                        raw_coolant = float(tel["coolant_temp"])
+                        current_stale_age = time.time() - last_good_telemetry if last_good_telemetry else 0.0
+                        rejection = coolant_rejection_reason(raw_coolant, last_coolant, cfg, current_stale_age)
+                        if rejection is None:
+                            last_raw_coolant = raw_coolant
+                            last_coolant = filter_coolant_reading(raw_coolant, last_coolant, cfg)
+                            last_good_telemetry = time.time()
+                        else:
+                            LOG.warning("discarding implausible coolant telemetry: %.1fC (%s)", raw_coolant, rejection)
+                else:
+                    LOG.warning("no fresh telemetry; using previous state")
+
+                stale_age = time.time() - last_good_telemetry if last_good_telemetry else float("inf")
+                if last_coolant is None or stale_age > cfg["telemetry_hard_stale_s"]:
+                    telemetry_state = "hard_stale"
+                elif stale_age > cfg["telemetry_soft_stale_s"]:
+                    telemetry_state = "soft_stale"
+                else:
+                    telemetry_state = "ok"
+                failsafe = telemetry_state == "hard_stale"
+
+                if telemetry_state == "hard_stale":
+                    target_pwm = max(last_target_pwm or 0, cfg["failsafe_pwm"])
+                    pump_rpm = max(last_pump_rpm or 0, cfg["failsafe_pump_rpm"])
+                elif telemetry_state == "soft_stale":
+                    target_pwm, pump_rpm = stale_targets(last_coolant, last_target_pwm, last_pump_rpm, cfg)
+                else:
+                    desired_pwm = apply_min_pwm(interpolate_pwm(float(last_coolant), cfg["fan_curve"]), cfg["min_pwm"])
+                    if last_target_pwm is not None and abs(desired_pwm - last_target_pwm) < cfg["pwm_hysteresis"]:
+                        target_pwm = last_target_pwm
+                    else:
+                        target_pwm = desired_pwm
+
+                    desired_pump = resolve_pump_rpm(float(last_coolant), cfg)
+                    if last_pump_rpm is not None and abs(desired_pump - last_pump_rpm) < cfg["rpm_hysteresis"]:
+                        pump_rpm = last_pump_rpm
+                    else:
+                        pump_rpm = desired_pump
+
+                if last_target_pwm is not None:
+                    target_pwm = slew_limit(
+                        last_target_pwm,
+                        target_pwm,
+                        up_step=cfg["pwm_ramp_up_per_tick"],
+                        down_step=cfg["pwm_ramp_down_per_tick"],
+                    )
+                if last_pump_rpm is not None:
+                    pump_rpm = slew_limit(
+                        last_pump_rpm,
+                        pump_rpm,
+                        up_step=cfg["rpm_ramp_up_per_tick"],
+                        down_step=cfg["rpm_ramp_down_per_tick"],
+                    )
+
+                try:
+                    send_control_packets(
+                        tx=tx,
+                        master_mac=master_mac,
+                        master_ch=master_ch,
+                        device_mac=device_mac,
+                        device_channel=device_channel,
+                        rx_type=rx_type,
+                        seq_index=seq_index,
+                        target_pwm=target_pwm,
+                        pump_rpm=pump_rpm,
+                        cfg=cfg,
+                    )
+                    last_target_pwm = target_pwm
+                    last_pump_rpm = pump_rpm
+                    if not read_failed:
+                        usb_failures = 0
+                except (USB_ERROR, RuntimeError, OSError) as exc:
+                    usb_failures += 1
+                    LOG.warning(
+                        "sending control packets failed (%s/%s): %s",
+                        usb_failures,
+                        cfg["usb_error_reconnect_threshold"],
+                        exc,
+                    )
+                    if usb_failures >= cfg["usb_error_reconnect_threshold"]:
+                        raise ReconnectRequested("control USB path failed repeatedly") from exc
+                except Exception as exc:
+                    LOG.warning("sending control packets failed: %s", exc)
+
+                if openrgb_bridge is not None:
+                    rgb_frame = openrgb_bridge.take_pending_frame()
+                    if rgb_frame is not None:
+                        try:
+                            send_rgb_direct(
+                                tx,
+                                master_mac=master_mac,
+                                device_mac=device_mac,
+                                device_channel=device_channel,
+                                rx_type=rx_type,
+                                colors=rgb_frame,
+                                tinyuz_library=cfg["tinyuz_library"],
+                            )
+                            LOG.info("applied OpenRGB RGB frame: %s LEDs", len(rgb_frame))
+                        except (USB_ERROR, OSError) as exc:
+                            usb_failures += 1
+                            LOG.warning(
+                                "OpenRGB RGB send failed (%s/%s): %s",
+                                usb_failures,
+                                cfg["usb_error_reconnect_threshold"],
+                                exc,
+                            )
+                            if usb_failures >= cfg["usb_error_reconnect_threshold"]:
+                                raise ReconnectRequested("OpenRGB RGB USB path failed repeatedly") from exc
+                        except Exception as exc:
+                            LOG.warning("OpenRGB RGB send failed: %s", exc)
+
+                if time.time() - last_log >= cfg["log_interval_s"]:
+                    rpm = last_tel["fan_rpms"] if last_tel else [0, 0, 0, 0]
+                    LOG.info(
+                        "coolant=%.1fC raw=%sC stale=%.1fs telemetry=%s failsafe=%s fan_pwm=%s/%s pump_target=%srpm rpm=%s",
+                        last_coolant if last_coolant is not None else -1.0,
+                        f"{last_raw_coolant:.1f}" if last_raw_coolant is not None else "n/a",
+                        stale_age,
+                        telemetry_state,
+                        failsafe,
+                        target_pwm,
+                        255,
+                        pump_rpm,
+                        rpm,
+                    )
+                    last_log = time.time()
+
+                elapsed = time.time() - loop_start
+                sleep_for = cfg["keepalive_interval_s"] - elapsed
+                if sleep_for > 0:
+                    sleep_interruptible(sleep_for)
+
+        except ReconnectRequested as exc:
+            LOG.warning("%s; reopening USB dongles in %.1fs", exc, cfg["discovery_retry_interval_s"])
+        except (DiscoveryError, USB_ERROR, RuntimeError, OSError) as exc:
+            LOG.warning("hardware discovery/control failed: %s; retrying in %.1fs", exc, cfg["discovery_retry_interval_s"])
+        finally:
+            if openrgb_bridge is not None:
+                openrgb_bridge.stop()
+            release(tx, "TX")
+            release(rx, "RX")
+
+        if running:
+            sleep_interruptible(cfg["discovery_retry_interval_s"])
+
+    LOG.info("goodbye")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

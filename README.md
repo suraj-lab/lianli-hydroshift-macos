@@ -152,6 +152,71 @@ hard stale after: 600s
 hard failsafe:    fan 160/255, pump 2800 rpm
 ```
 
+Discovery / USB recovery:
+
+```text
+startup discovery retry:       30s
+USB error reconnect threshold: 3 consecutive read/write failures
+```
+
+If macOS can see the wireless master but not the bound AIO, the daemon now stays alive, releases USB handles, and retries discovery instead of exiting and relying on launchd to respawn it. During the control loop, repeated PyUSB/libusb read/write failures trigger a clean dongle reopen.
+
+## OpenRGB bridge
+
+The daemon can expose the discovered HydroShift II as an **OpenRGB SDK server**. OpenRGB connects over TCP while this daemon keeps exclusive ownership of the Lian Li USB/RF dongles.
+
+Config keys:
+
+```json
+{
+  "openrgb_server": true,
+  "openrgb_host": "127.0.0.1",
+  "openrgb_port": 6743,
+  "tinyuz_library": ""
+}
+```
+
+Connect OpenRGB as a client:
+
+```bash
+/Applications/OpenRGB.app/Contents/MacOS/OpenRGB --gui --noautoconnect --client 127.0.0.1:6743
+```
+
+Or list the daemon-exposed device:
+
+```bash
+/Applications/OpenRGB.app/Contents/MacOS/OpenRGB --noautoconnect --client 127.0.0.1:6743 --list-devices
+```
+
+Direct RGB packets require the Lian Li firmware's `tinyuz` compression. Build the bundled MIT-licensed compressor bridge once:
+
+```bash
+./scripts/build-tinyuz-lib.sh
+```
+
+By default this writes `lianli_hydroshift/libtinyuz.dylib`, which the daemon auto-detects. You can also set `tinyuz_library` or `LIANLI_TINYUZ_LIB` to another shared library that exports `tuz_compress_mem` and `tuz_max_compressed_size`; without it, OpenRGB device enumeration works but colour updates are logged and ignored safely.
+
+To load an OpenRGB profile in the background at login, save a profile such as `~/.config/OpenRGB/MacOS.orp`, then install the user LaunchAgent:
+
+```bash
+./scripts/install-openrgb-launchagent.sh
+```
+
+Environment overrides:
+
+```bash
+OPENRGB_PROFILE="$HOME/.config/OpenRGB/MacOS.orp" \
+OPENRGB_BRIDGE_HOST=127.0.0.1 \
+OPENRGB_BRIDGE_PORT=6743 \
+./scripts/install-openrgb-launchagent.sh
+```
+
+This LaunchAgent waits for the HydroShift bridge, then starts OpenRGB minimized with `--noautoconnect --client 127.0.0.1:6743 --profile <profile>`. Remove it with:
+
+```bash
+./scripts/uninstall-openrgb-launchagent.sh
+```
+
 ## Load testing / curve tuning
 
 Run a bounded CPU load while watching the daemon log:

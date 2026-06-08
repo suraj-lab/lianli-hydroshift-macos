@@ -53,5 +53,11 @@
   "theme_index_max": 31,
   "brightness": 80,
   "rotation": 0,
-  "send_master_clock": false
+  "send_master_clock": false,
+  "openrgb_server": false,
+  "openrgb_host": "127.0.0.1",
+  "openrgb_port": 6743,
+  "tinyuz_library": "",
+  "discovery_retry_interval_s": 30.0,
+  "usb_error_reconnect_threshold": 3
 }

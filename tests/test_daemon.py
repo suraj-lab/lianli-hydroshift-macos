@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from lianli_hydroshift import daemon as d
+from lianli_hydroshift import openrgb as orgb
 
 
 MASTER = bytes.fromhex("010203040506")
@@ -70,6 +71,47 @@ class DaemonProtocolTests(unittest.TestCase):
         # Only one device is bound to this master in the frame, so command index is 1.
         self.assertEqual(aio["seq_index"], 1)
 
+    def test_discovery_summary_counts_unbound_records(self):
+        frame = bytes([d.USB_CMD_SEND_RF, 1, 0, 0]) + record(master=OTHER_MASTER)
+        summary = d.discovery_summary([frame], MASTER)
+        self.assertIn("frames=1", summary)
+        self.assertIn("records=1", summary)
+        self.assertIn("bound=0", summary)
+        self.assertIn(str(d.DEVICE_TYPE_WATERBLOCK2), summary)
+
+    def test_connect_hydroshift_releases_handles_when_aio_missing(self):
+        tx = object()
+        rx = object()
+        claimed = []
+        released = []
+        originals = {
+            "find_dongle": d.find_dongle,
+            "claim": d.claim,
+            "release": d.release,
+            "discover_master": d.discover_master,
+            "collect_rx_frames": d.collect_rx_frames,
+        }
+
+        def fake_find_dongle(ids):
+            return tx if ids == d.TX_IDS else rx
+
+        try:
+            d.find_dongle = fake_find_dongle
+            d.claim = claimed.append
+            d.release = lambda dev, name: released.append((dev, name))
+            d.discover_master = lambda _tx: (MASTER, 8)
+            d.collect_rx_frames = lambda _rx, count=3, max_wait=3.0: [
+                bytes([d.USB_CMD_SEND_RF, 1, 0, 0]) + record(master=OTHER_MASTER)
+            ]
+            with self.assertRaises(d.DiscoveryError) as cm:
+                d.connect_hydroshift()
+            self.assertIn("no bound HydroShift", str(cm.exception))
+            self.assertEqual(claimed, [tx, rx])
+            self.assertEqual(released, [(tx, "TX"), (rx, "RX")])
+        finally:
+            for name, original in originals.items():
+                setattr(d, name, original)
+
     def test_fallback_scan_checks_last_possible_record_offset(self):
         # Regression for range(len(frame) - 42), which missed a record at the
         # final valid start offset.
@@ -117,10 +159,74 @@ class DaemonProtocolTests(unittest.TestCase):
         self.assertLess(pwm, cfg["failsafe_pwm"])
         self.assertLess(pump, cfg["failsafe_pump_rpm"])
 
+    def test_rgb_direct_frame_layout_matches_wireless_protocol(self):
+        compressed = bytes(range(230))
+        frames = d.build_rgb_direct_frames(
+            master_mac=MASTER,
+            device_mac=DEVICE,
+            colors=[(255, 0, 0), (0, 255, 0)],
+            effect_index=b"\x01\x02\x03\x04",
+            compressor=lambda raw: compressed,
+            interval_ms=5000,
+        )
+        self.assertEqual(len(frames), 3)
+        header, first, second = frames
+        self.assertEqual(header[0], d.RF_SELECT)
+        self.assertEqual(header[1], d.RF_SET_RGB)
+        self.assertEqual(header[2:8], DEVICE)
+        self.assertEqual(header[8:14], MASTER)
+        self.assertEqual(header[14:18], b"\x01\x02\x03\x04")
+        self.assertEqual(header[18], 0)
+        self.assertEqual(header[19], 3)  # header + two payload packets
+        self.assertEqual(int.from_bytes(header[20:24], "big"), len(compressed))
+        self.assertEqual(int.from_bytes(header[25:27], "big"), 1)
+        self.assertEqual(header[27], 2)
+        self.assertEqual(int.from_bytes(header[32:34], "big"), 5000)
+        self.assertEqual(first[18], 1)
+        self.assertEqual(first[20:240], compressed[:220])
+        self.assertEqual(second[18], 2)
+        self.assertEqual(second[20:30], compressed[220:])
+
+    def test_openrgb_device_from_aio_record_has_pump_and_fan_zones(self):
+        rec = d.parse_record(record(coolant=33))
+        dev = d.openrgb_device_from_record(rec)
+        self.assertEqual(dev.name, "HydroShift II LCD-S (Wireless)")
+        self.assertEqual([z.name for z in dev.zones], ["Pump Head", "Fan 1", "Fan 2", "Fan 3"])
+        self.assertEqual(dev.total_leds, 96)
+
     def test_slew_limit_slows_audible_steps(self):
         self.assertEqual(d.slew_limit(35, 60, up_step=4, down_step=3), 39)
         self.assertEqual(d.slew_limit(60, 35, up_step=4, down_step=3), 57)
         self.assertEqual(d.slew_limit(35, 37, up_step=4, down_step=3), 37)
+
+
+class OpenRgbBridgeTests(unittest.TestCase):
+    def test_bridge_splits_full_led_updates_into_zones(self):
+        dev = orgb.OpenRgbDevice(
+            name="Test AIO",
+            vendor="Lian Li",
+            serial="aa:bb:cc:dd:ee:ff",
+            zones=[orgb.OpenRgbZone("Pump", 2), orgb.OpenRgbZone("Fan", 3)],
+        )
+        bridge = orgb.OpenRgbBridge(dev)
+        bridge.set_all_colors([(1, 2, 3), (4, 5, 6), (7, 8, 9), (10, 11, 12), (13, 14, 15)])
+        self.assertEqual(
+            bridge.take_pending_frame(),
+            [(1, 2, 3), (4, 5, 6), (7, 8, 9), (10, 11, 12), (13, 14, 15)],
+        )
+        self.assertIsNone(bridge.take_pending_frame())
+
+    def test_bridge_zone_and_single_led_updates_preserve_flat_order(self):
+        dev = orgb.OpenRgbDevice(
+            name="Test AIO",
+            vendor="Lian Li",
+            serial="aa:bb:cc:dd:ee:ff",
+            zones=[orgb.OpenRgbZone("Pump", 2), orgb.OpenRgbZone("Fan", 2)],
+        )
+        bridge = orgb.OpenRgbBridge(dev)
+        bridge.set_zone_colors(1, [(9, 8, 7), (6, 5, 4)])
+        bridge.set_single_led(0, (1, 2, 3))
+        self.assertEqual(bridge.take_pending_frame(), [(1, 2, 3), (255, 255, 255), (9, 8, 7), (6, 5, 4)])
 
 
 class SetThemeConfigTests(unittest.TestCase):
