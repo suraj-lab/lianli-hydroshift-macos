@@ -265,6 +265,50 @@ Command codes: CMD_REBOOT=0x0B, CMD_SWITCH_TO_DESKTOP=0x96, CMD_STOP_PLAY=0x7B
 
 `theme_index_max` has been hard-clamped to 12 to prevent recurrence.
 
+### Recovery attempts — all failed (2026-06-16/17)
+
+Every software path to reach the crashed LCD controller was exhausted:
+
+- **macOS (pyusb/IOKit)**: bulk OUT (EP 0x01) writes time out — even raw zeros.
+  Control transfers on EP0 return STALL (Errno 32 pipe error), confirming the
+  USB hardware is alive but the firmware does not service the bulk endpoint.
+- **Arch Linux (usbfs)**: same failure — bulk endpoint never ACKs. Rules out a
+  macOS/IOKit-specific limitation.
+- **Windows + L-Connect 3**: the wireless controller fails to initialise on
+  Windows, so L-Connect 3 never reaches the LCD firmware-flash screen at all.
+- **Windows + Zadig/WinUSB + lcd-reboot.py**: planned as last resort (assign
+  WinUSB to 1CBE:A034 directly, bypassing the dongle). Not attempted after the
+  RMA was agreed — see below.
+
+Conclusion: the LCD controller firmware is genuinely crashed in flash and is
+unreachable by any host OS. This is a firmware defect — a user-writable theme
+index should never be able to permanently brick the controller.
+
+### RMA outcome (2026-06-17)
+
+Lian Li agreed to send a **replacement display** after being shown the symptom
+and serial number (`5047490364c6c701w`). They treated it as a defect rather than
+user error. Awaiting their answer on what happens if the replacement also fails.
+
+Next-step guardrails for the replacement unit:
+
+- Keep `theme_index_max` clamped to 12. Do **not** raise it. 13+ bricks the
+  hardware with no software recovery path on any OS.
+- Confirm the replacement's firmware version before any theme work. If it ships
+  newer than `lianli-H2S-1.7`, re-verify the valid theme range conservatively
+  using `--set-theme N` one index at a time — do **not** run the auto `--scan-themes`
+  range, which is what walked into the bad index originally.
+
+## Roadmap: native macOS app
+
+Once the replacement display arrives / Lian Li responds, the project pivots from
+a CLI daemon to a proper macOS app. High-level intent (to be planned in detail):
+
+- Menu-bar app surfacing live coolant temp, fan/pump RPM, and theme.
+- Config UI for the fan/pump curves instead of hand-edited config.json.
+- Keep the existing daemon as the control backend; the app talks to it.
+- Safe theme picker constrained to the verified 0–12 range.
+
 ## Known issues / observations
 
 - RX telemetry can be noisy under heavy CPU load and sometimes reports implausibly low coolant values.
