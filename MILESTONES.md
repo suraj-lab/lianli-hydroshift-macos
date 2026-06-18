@@ -232,6 +232,242 @@ Likely next steps:
 3. Prototype one static RGB command from this daemon or a separate test script.
 4. Only then consider OpenRGB integration.
 
+## Milestone 8 — Recovery and self-healing hardening ✅
+
+Status: complete. Started from the 2026-06-18 unbound-AIO/RGB recovery session;
+all sub-tasks (8.1–8.6) are done. Test suite at 57 passing.
+
+Context / failure mode observed:
+
+- The daemon was running and the TX/RX dongles were present.
+- RX could see the HydroShift AIO record, but the AIO advertised itself as
+  unbound:
+  - AIO MAC: `2d:a3:74:e5:66:e1`
+  - reported master: `00:00:00:00:00:00`
+  - reported rx type: `254`
+  - device type: `11` / WaterBlock2
+- The daemon's normal discovery path filtered by the local master MAC and
+  therefore reported `no bound HydroShift/WaterBlock AIO device found` even
+  though the hardware was visible.
+- Recovery required sending the upstream-style bind packet, saving RF config,
+  kickstarting the daemon, then reapplying the OpenRGB profile.
+- After recovery, healthy state was verified by:
+  - daemon entering control loop
+  - `telemetry=ok`
+  - fan/pump RPM telemetry present
+  - OpenRGB profile matching `wireless:2d:a3:74:e5:66:e1`
+  - daemon logging `applied OpenRGB RGB frame: 96 LEDs`
+
+### 8.1 Discovery state classification ✅
+
+Goal: make logs/status distinguish the actual failure mode instead of collapsing
+all cases into "no bound AIO".
+
+Completed:
+
+- Added `DiscoveryState` enum and `DiscoveryResult` dataclass plus
+  `classify_discovery()` in `lianli_hydroshift/daemon.py`, covering:
+  - TX missing
+  - RX missing
+  - master unknown (TX did not answer GET_MAC scan)
+  - no AIO records visible
+  - AIO visible but unbound (`master=00:00:00:00:00:00`)
+  - AIO visible but bound to a different master
+  - AIO visible and bound to this master (the only healthy state)
+- Added `aio_detail()` helper that formats the AIO MAC, advertised master,
+  channel, rx type, and device type for warning logs.
+- `connect_hydroshift()` now classifies the attempt and, for a visible
+  unbound/foreign AIO, logs an explicit warning with the AIO identity before
+  raising. The bound happy path is unchanged (refactored to share `_prefer_aio`).
+- Added `DiscoveryClassificationTests` with representative RX records for each
+  state (9 tests), including bound-over-unbound preference.
+
+Acceptance criteria:
+
+- A visible unbound AIO produces an explicit log such as
+  `AIO visible but unbound`, not only `no bound AIO found`. ✅
+- Existing bound-device discovery behavior remains unchanged. ✅
+
+### 8.2 Recovery tooling: bind-aware recovery
+
+Goal: make the manual recovery path handle both "already bound but stale" and
+"visible but unbound" cases.
+
+Completed:
+
+- `scripts/recover-display.py` now detects an AIO record even when it is not
+  bound to the local master.
+- If needed, it sends the bind packet, waits for convergence, and sends
+  SaveConfig before the wireless-theme switch burst.
+- Refactored the bind/save RF-frame construction out of the script into reusable
+  `cmd_bind_aio()` and `cmd_save_config()` builders in
+  `lianli_hydroshift/daemon.py`; the script now imports them. Added the
+  `RF_SAVE_CONFIG`, `BROADCAST_MAC`, and `BROADCAST_RX` constants.
+- Added a non-destructive `--dry-run` flag to `recover-display.py` (and via the
+  `recover-display.sh` wrapper). It diagnoses discovery/bind state and prints the
+  intended bind/SaveConfig/switch actions without sending any RF writes.
+- Added `BindPacketTests` covering bind packet construction:
+  - target master copied to bytes 8..14
+  - target rx copied to bytes 14 and 16
+  - current PWM copied to bytes 17..21
+  - PWM length validation
+  - SaveConfig broadcast uses target `ff:ff:ff:ff:ff:ff` and rx `0xff`
+
+Acceptance criteria:
+
+- `./scripts/recover-display.sh` can recover a visible unbound AIO without a
+  one-off Python snippet.
+- The script prints before/after binding state clearly.
+
+### 8.3 Optional daemon self-healing ✅
+
+Goal: decide whether the daemon should automatically re-bind in the narrow safe
+case.
+
+Completed:
+
+- Added config-gated auto-rebind support, defaulting off:
+
+```json
+"auto_rebind_visible_aio": false,
+"auto_rebind_allow_list": []
+```
+
+- `should_auto_rebind(result, cfg)` is a pure decision function that returns
+  `(True, reason)` only when auto-rebind is enabled AND all safety conditions
+  hold:
+  - state is `AIO_UNBOUND`
+  - exactly one AIO is visible
+  - it is unbound (master is all-zero)
+  - no other device already holds the target rx slot under the local master
+  - the AIO MAC is in `auto_rebind_allow_list` (empty list = any single unbound
+    AIO once enabled)
+- `perform_auto_rebind()` sends the bind frame (via `cmd_bind_aio`), re-classifies
+  until bound or timeout, then broadcasts SaveConfig (`cmd_save_config`). It
+  returns the final `DiscoveryResult` so `connect_hydroshift()` proceeds only if
+  the AIO is now bound.
+- `connect_hydroshift(cfg)` invokes the above only for `AIO_UNBOUND`; the default
+  config never reaches the rebind path. When not eligible / still unbound, it
+  logs the exact safe recovery command:
+  `to recover, run: ./scripts/recover-display.sh (use --dry-run first)`.
+- `auto_rebind_visible_aio` / `auto_rebind_allow_list` added to the config
+  defaults, validation (`normalize_mac_list`), and `config/config.example.json`.
+- Added `AutoRebindTests` covering the disabled default, eligibility, the
+  multi-AIO and wrong-state rejections, allow-list behavior, and MAC
+  normalization.
+
+Acceptance criteria:
+
+- Default daemon behavior remains conservative and non-mutating (flag defaults
+  off; the rebind path is unreachable without opt-in). ✅
+- Enabling auto-rebind makes the daemon recover the 2026-06-18 failure mode
+  without manual bind snippets. ✅
+
+### 8.4 OpenRGB/RGB reapply robustness ✅
+
+Goal: keep RGB in sync after daemon restart, AIO rebind, or wireless-theme
+re-engage.
+
+Completed:
+
+- Staged OpenRGB logging now distinguishes:
+  - bridge listening (`OpenRGB SDK bridge listening on …`)
+  - OpenRGB client connected (`OpenRGB client connected from …`)
+  - profile/device matched (`OpenRGB profile matched device: … (serial
+    wireless:…)`, logged once when the client first reads controller data)
+  - actual RGB frame received (tracked via `OpenRgbBridge.has_received_frame`)
+  - RGB frame sent (`applied OpenRGB RGB frame: N LEDs`, with a distinct
+    `re-applied cached OpenRGB RGB frame: N LEDs` for re-sends)
+- The last successfully sent RGB frame is cached in `main()` in a variable that
+  survives reconnects. On every (re)connect — which covers AIO rebind, daemon-
+  side USB reopen, and wireless-theme re-engage, since all go through the outer
+  reconnect loop — the new bridge is seeded with `prime_frame()` so the cooler is
+  restored to the last known colours without waiting for the client.
+- `OpenRgbBridge.prime_frame()` / `has_received_frame` added; client updates mark
+  `_received_frame` so only genuinely received frames are re-applied (never the
+  default white state).
+- Added `scripts/reapply-openrgb-profile.sh` to kickstart the `org.openrgb`
+  LaunchAgent (which waits for the bridge and reloads `~/.config/OpenRGB/MacOS.orp`)
+  for the case where OpenRGB itself was restarted.
+- OpenRGB LaunchAgent `org.openrgb` and bridge port state are reported by the new
+  `scripts/doctor.sh` from 8.5 (the doctor superseded extending `status.sh`).
+- Added `OpenRgbBridgeTests` coverage for prime/re-send, received-frame tracking,
+  and empty-frame guard.
+
+Acceptance criteria:
+
+- After recovery, status (`doctor`) shows whether RGB has actually been applied
+  (last RGB frame age), not just whether OpenRGB is connected. ✅
+- A daemon reconnect does not leave the cooler on mismatched RGB if a previous
+  RGB frame is known — the cached frame is primed and re-sent. ✅
+
+### 8.5 Status / doctor command ✅
+
+Goal: replace ad-hoc diagnostics with one clear operator-facing health report.
+
+Completed:
+
+- Added `scripts/doctor.sh` plus a `--doctor` mode in
+  `lianli_hydroshift/daemon.py`. The shell wrapper handles launchd/LaunchAgent
+  state; the Python core handles USB/telemetry/OpenRGB and the final verdict.
+- Reports:
+  - LaunchDaemon plist installed and loaded state (sudo gap reported explicitly)
+  - TX/RX USB presence (non-invasive enumeration, no claim)
+  - LCD direct USB presence
+  - daemon telemetry freshness (parsed from the log: state + age)
+  - discovery/bind state (parsed from the explicit 8.1 log messages)
+  - OpenRGB bridge port reachability
+  - OpenRGB process running state and last applied RGB frame age
+  - OpenRGB LaunchAgent `org.openrgb` state
+- Sudo/password failures are explicit (`needs sudo to query …`) instead of a
+  misleading `not loaded`.
+- Added a pure `classify_health()` returning a `HealthStatus`
+  (healthy / disconnected / daemon_down / unbound / stale / rgb_not_applied) and
+  a suggested next action, with `DoctorLogParsingTests` and
+  `DoctorClassificationTests` covering both the log parsers and the verdict
+  precedence.
+
+Notes:
+
+- Master MAC/channel and a full live AIO-record scan are intentionally read from
+  the daemon log rather than taken over USB, so `doctor` is non-invasive and does
+  not fight the running daemon for the dongles.
+
+Acceptance criteria:
+
+- One command classifies the system as healthy, unbound, disconnected, or RGB
+  not-applied (plus daemon-down and stale refinements). ✅
+- The command suggests the next safe action for each unhealthy state. ✅
+- Verified live: reports `STATUS: HEALTHY` on Suraj's Hackintosh with all signals
+  matching the running daemon. ✅
+
+### 8.6 Documentation and runbook ✅
+
+Goal: preserve the recovery knowledge from this incident.
+
+Completed:
+
+- Added `docs/recovery.md` covering:
+  - healthy-state doctor example
+  - per-`STATUS` recovery (disconnected, daemon-down, unbound, stale,
+    rgb-not-applied)
+  - unbound AIO symptoms and the bind recovery flow (`recover-display.sh`,
+    `--dry-run` first)
+  - daemon kickstart
+  - OpenRGB profile reapply (`reapply-openrgb-profile.sh`)
+  - optional daemon auto-rebind opt-in
+  - when to stop and physically inspect/replug or RMA (including the
+    non-recoverable LCD-flash corruption guardrail)
+  - a healthy-state verification checklist
+- Updated `README.md` with a Troubleshooting section: doctor-first guidance, a
+  `STATUS -> next step` table, the auto-rebind opt-in, and a link to
+  `docs/recovery.md`.
+
+Acceptance criteria:
+
+- The next recurrence can be handled from docs/scripts without reconstructing
+  packet details from logs or upstream source. ✅
+
 ## Display recovery incident (2026-06-04)
 
 Theme scan probed index 13 which corrupted the AIO display state. The display
@@ -328,7 +564,10 @@ Daily-driver state is accepted for now:
 
 Next recommended work, in order:
 
-1. Use the system normally and observe logs/noise for a few days.
-2. Catalogue theme indexes.
-3. Harden install location if this becomes permanent.
-4. Research RGB/OpenRGB integration.
+1. ~~Finish Milestone 8 recovery/self-healing hardening.~~ ✅ Done (8.1–8.6).
+2. Use the system normally and observe logs/noise for a few days; run
+   `./scripts/doctor.sh` if anything looks off.
+3. Catalogue safe theme indexes only within the verified guardrail range, once
+   the RMA replacement display arrives.
+4. Harden install location (Milestone 6) if this becomes permanent.
+5. Continue native macOS app planning.

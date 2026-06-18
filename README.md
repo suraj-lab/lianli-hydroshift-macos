@@ -161,6 +161,32 @@ USB error reconnect threshold: 3 consecutive read/write failures
 
 If macOS can see the wireless master but not the bound AIO, the daemon now stays alive, releases USB handles, and retries discovery instead of exiting and relying on launchd to respawn it. During the control loop, repeated PyUSB/libusb read/write failures trigger a clean dongle reopen.
 
+## Troubleshooting / health check
+
+Run the doctor first — it is read-only (no RF writes, does not take the dongles) and classifies the system with a suggested next action:
+
+```bash
+./scripts/doctor.sh
+```
+
+| STATUS | Meaning | Next step |
+| --- | --- | --- |
+| `HEALTHY` | All checks pass | nothing to do |
+| `DISCONNECTED` | TX/RX dongle missing | reseat/replug the USB dongle |
+| `DAEMON_DOWN` | Hardware present, daemon not running | `sudo launchctl kickstart -k system/com.suraj.lianli-hydroshift` |
+| `UNBOUND` | AIO visible but unbound (2026-06-18 mode) | `./scripts/recover-display.sh --dry-run` then without `--dry-run` |
+| `STALE` | No fresh telemetry | check the log; kickstart if it persists |
+| `RGB_NOT_APPLIED` | Cooling fine, RGB out of sync | `./scripts/reapply-openrgb-profile.sh` |
+
+Full step-by-step recovery, healthy/unbound examples, and when to stop and inspect hardware: [`docs/recovery.md`](docs/recovery.md).
+
+Opt-in daemon self-healing for the unbound case (default off):
+
+```json
+"auto_rebind_visible_aio": true,
+"auto_rebind_allow_list": ["2d:a3:74:e5:66:e1"]
+```
+
 ## OpenRGB bridge
 
 The daemon can expose the discovered HydroShift II as an **OpenRGB SDK server**. OpenRGB connects over TCP while this daemon keeps exclusive ownership of the Lian Li USB/RF dongles.

@@ -12,12 +12,17 @@ import argparse
 import copy
 import ctypes
 import ctypes.util
+import enum
 import json
 import logging
 import os
 import signal
+import socket
+import subprocess
 import sys
 import time
+from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -38,6 +43,9 @@ LOG = logging.getLogger("lianli-hydroshift")
 
 TX_IDS = [(0x0416, 0x8040), (0x1A86, 0xE304)]
 RX_IDS = [(0x0416, 0x8041), (0x1A86, 0xE305)]
+# Direct LCD controller (not the wireless path); only reachable when its
+# firmware is healthy. See the 2026-06-04 display recovery incident.
+LCD_IDS = [(0x1CBE, 0xA034)]
 
 USB_CMD_SEND_RF = 0x10
 USB_CMD_GET_MAC = 0x11
@@ -49,7 +57,10 @@ RF_MASTER_CLOCK = 0x14
 RF_AIO_SWITCH_WIRELESS = 0x19
 RF_SET_RGB = 0x20
 RF_AIO_PARAMS = 0x21
+RF_SAVE_CONFIG = 0x15
 RF_DATA_SIZE = 240
+BROADCAST_MAC = b"\xff" * 6
+BROADCAST_RX = 0xFF
 RF_CHUNK_SIZE = 60
 RF_CHUNKS = 4
 AIO_PARAM_LEN = 32
@@ -57,6 +68,12 @@ AIO_PARAM_LEN = 32
 DEVICE_TYPE_WATERBLOCK = 10
 DEVICE_TYPE_WATERBLOCK2 = 11
 AIO_DEVICE_TYPES = {DEVICE_TYPE_WATERBLOCK, DEVICE_TYPE_WATERBLOCK2}
+
+# An AIO that has not been bound to a master advertises an all-zero master MAC
+# (the 2026-06-18 failure mode). parse_record already rejects records whose
+# rx_type byte is 0xFF, so an "invalid rx_type" here means the bind handshake
+# has not completed even though the device is otherwise visible.
+ZERO_MAC = b"\x00" * 6
 
 PUMP_MIN_RPM = 1600
 PUMP_MAX_RPM_WATERBLOCK = 2500
@@ -146,6 +163,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # failures instead of letting launchd restart it every ~30 seconds.
     "discovery_retry_interval_s": 30.0,
     "usb_error_reconnect_threshold": 3,
+    # Conservative, OFF by default. When enabled, the daemon may automatically
+    # re-bind a single visible-but-unbound AIO (the 2026-06-18 failure mode)
+    # instead of only logging the manual recovery command. Only triggers under
+    # the strict safety checks in should_auto_rebind(). When disabled, the daemon
+    # logs the exact recover-display.sh command to run.
+    "auto_rebind_visible_aio": False,
+    # Optional allow-list of AIO MACs (e.g. "2d:a3:74:e5:66:e1") permitted for
+    # auto-rebind. Empty means "any single unbound AIO" once auto-rebind is on.
+    "auto_rebind_allow_list": [],
 }
 
 running = True
@@ -154,6 +180,56 @@ reload_requested = False
 
 class DiscoveryError(RuntimeError):
     """Recoverable failure while finding the wireless AIO path."""
+
+
+class DiscoveryState(enum.Enum):
+    """Classified outcome of an AIO discovery attempt.
+
+    Distinguishing these states lets logs/status report the actual failure mode
+    instead of collapsing everything into "no bound AIO". Only ``AIO_BOUND`` is a
+    success; the rest are recoverable conditions with different next actions.
+    """
+
+    TX_MISSING = "tx_missing"
+    RX_MISSING = "rx_missing"
+    MASTER_UNKNOWN = "master_unknown"
+    NO_AIO_RECORDS = "no_aio_records"
+    AIO_UNBOUND = "aio_unbound"
+    AIO_FOREIGN = "aio_foreign"
+    AIO_BOUND = "aio_bound"
+
+
+@dataclass
+class DiscoveryResult:
+    """Structured result of classifying a discovery attempt."""
+
+    state: DiscoveryState
+    master_mac: bytes | None = None
+    aio: dict[str, Any] | None = None
+    aio_records: list[dict[str, Any]] = field(default_factory=list)
+    records: list[dict[str, Any]] = field(default_factory=list)
+    frame_count: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return self.state is DiscoveryState.AIO_BOUND
+
+    def message(self) -> str:
+        """Operator-facing one-line description of the state."""
+        detail = aio_detail(self.aio) if self.aio is not None else None
+        if self.state is DiscoveryState.TX_MISSING:
+            return "TX wireless dongle not found"
+        if self.state is DiscoveryState.RX_MISSING:
+            return "RX wireless dongle not found"
+        if self.state is DiscoveryState.MASTER_UNKNOWN:
+            return "TX dongle did not respond to GET_MAC scan"
+        if self.state is DiscoveryState.NO_AIO_RECORDS:
+            return f"no HydroShift/WaterBlock AIO records visible (frames={self.frame_count})"
+        if self.state is DiscoveryState.AIO_UNBOUND:
+            return f"AIO visible but unbound ({detail})"
+        if self.state is DiscoveryState.AIO_FOREIGN:
+            return f"AIO visible but bound to a different master ({detail})"
+        return f"AIO bound to this master ({detail})"
 
 
 class ReconnectRequested(RuntimeError):
@@ -398,6 +474,25 @@ def parse_frame_records(frame: bytes) -> list[dict[str, Any]]:
     return records
 
 
+def aio_detail(rec: dict[str, Any]) -> str:
+    """Compact AIO identity string for warning logs and status output."""
+    return (
+        f"mac={rec['mac'].hex(':')} master={rec['master_mac'].hex(':')} "
+        f"ch={rec['channel']} rx_type={rec['rx_type']} device_type={rec['device_type']}"
+    )
+
+
+def _prefer_aio(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Pick the preferred AIO record (WaterBlock2 first, then WaterBlock)."""
+    for rec in records:
+        if rec["device_type"] == DEVICE_TYPE_WATERBLOCK2:
+            return rec
+    for rec in records:
+        if rec["device_type"] == DEVICE_TYPE_WATERBLOCK:
+            return rec
+    return None
+
+
 def find_aio(frames: list[bytes], master_mac: bytes | None = None) -> dict[str, Any] | None:
     all_records: list[dict[str, Any]] = []
     for frame in frames:
@@ -413,13 +508,109 @@ def find_aio(frames: list[bytes], master_mac: bytes | None = None) -> dict[str, 
     for idx, rec in enumerate(bound_records):
         rec["seq_index"] = idx + 1
 
-    for rec in bound_records:
-        if rec["device_type"] == DEVICE_TYPE_WATERBLOCK2:
-            return rec
-    for rec in bound_records:
-        if rec["device_type"] == DEVICE_TYPE_WATERBLOCK:
-            return rec
-    return None
+    return _prefer_aio(bound_records)
+
+
+def classify_discovery(
+    frames: list[bytes],
+    master_mac: bytes | None,
+    *,
+    tx_present: bool = True,
+    rx_present: bool = True,
+) -> DiscoveryResult:
+    """Classify a discovery attempt into a structured :class:`DiscoveryResult`.
+
+    Precedence reflects what the operator must fix first: missing hardware, then
+    an unknown master, then the AIO bind state. Only ``AIO_BOUND`` is healthy.
+    """
+    if not tx_present:
+        return DiscoveryResult(DiscoveryState.TX_MISSING, frame_count=len(frames))
+    if not rx_present:
+        return DiscoveryResult(DiscoveryState.RX_MISSING, frame_count=len(frames))
+    if master_mac is None:
+        return DiscoveryResult(DiscoveryState.MASTER_UNKNOWN, frame_count=len(frames))
+
+    records: list[dict[str, Any]] = []
+    for frame in frames:
+        records.extend(parse_frame_records(frame))
+    aio_records = [r for r in records if r["device_type"] in AIO_DEVICE_TYPES]
+
+    if not aio_records:
+        return DiscoveryResult(
+            DiscoveryState.NO_AIO_RECORDS,
+            master_mac=master_mac,
+            records=records,
+            frame_count=len(frames),
+        )
+
+    bound = [r for r in aio_records if r["master_mac"] == master_mac]
+    if bound:
+        for idx, rec in enumerate(bound):
+            rec["seq_index"] = idx + 1
+        return DiscoveryResult(
+            DiscoveryState.AIO_BOUND,
+            master_mac=master_mac,
+            aio=_prefer_aio(bound),
+            aio_records=aio_records,
+            records=records,
+            frame_count=len(frames),
+        )
+
+    unbound = [r for r in aio_records if r["master_mac"] == ZERO_MAC]
+    if unbound:
+        return DiscoveryResult(
+            DiscoveryState.AIO_UNBOUND,
+            master_mac=master_mac,
+            aio=_prefer_aio(unbound),
+            aio_records=aio_records,
+            records=records,
+            frame_count=len(frames),
+        )
+
+    # Visible AIO records that belong to some other, non-zero master.
+    return DiscoveryResult(
+        DiscoveryState.AIO_FOREIGN,
+        master_mac=master_mac,
+        aio=_prefer_aio(aio_records),
+        aio_records=aio_records,
+        records=records,
+        frame_count=len(frames),
+    )
+
+
+# Slot the daemon binds an auto-recovered AIO into. Matches recover-display.py.
+AUTO_REBIND_TARGET_RX = 1
+
+
+def should_auto_rebind(
+    result: DiscoveryResult,
+    cfg: dict[str, Any],
+    target_rx: int = AUTO_REBIND_TARGET_RX,
+) -> tuple[bool, str]:
+    """Decide whether the daemon may automatically re-bind a visible AIO.
+
+    Conservative by design: returns ``(True, reason)`` only when auto-rebind is
+    enabled AND every safety condition holds, so the default daemon never mutates
+    device binding on its own. The reason is logged either way.
+    """
+    if not cfg.get("auto_rebind_visible_aio"):
+        return False, "auto_rebind_visible_aio is disabled"
+    if result.state is not DiscoveryState.AIO_UNBOUND:
+        return False, f"state {result.state.value} is not auto-rebindable"
+    if len(result.aio_records) != 1:
+        return False, f"expected exactly one visible AIO, found {len(result.aio_records)}"
+    aio = result.aio
+    if aio is None or aio["master_mac"] != ZERO_MAC:
+        return False, "AIO is not unbound (master is not all-zero)"
+    if any(
+        r["master_mac"] == result.master_mac and r["rx_type"] == target_rx
+        for r in result.records
+    ):
+        return False, f"target rx {target_rx} already occupied under this master"
+    allow_list = cfg.get("auto_rebind_allow_list") or []
+    if allow_list and aio["mac"].hex(":") not in allow_list:
+        return False, f"AIO {aio['mac'].hex(':')} not in auto_rebind_allow_list"
+    return True, f"single unbound AIO {aio['mac'].hex(':')} eligible for auto-rebind"
 
 
 def discovery_summary(frames: list[bytes], master_mac: bytes | None) -> str:
@@ -431,7 +622,7 @@ def discovery_summary(frames: list[bytes], master_mac: bytes | None) -> str:
     return f"frames={len(frames)} records={len(records)} bound={bound_count} device_types={device_types}"
 
 
-def connect_hydroshift() -> tuple[Any, Any, dict[str, Any]]:
+def connect_hydroshift(cfg: dict[str, Any] | None = None) -> tuple[Any, Any, dict[str, Any]]:
     """Open USB dongles and locate the bound HydroShift AIO.
 
     All failures here are recoverable for a daemon: the dongle may still be
@@ -444,27 +635,45 @@ def connect_hydroshift() -> tuple[Any, Any, dict[str, Any]]:
         tx = find_dongle(TX_IDS)
         rx = find_dongle(RX_IDS)
         if tx is None or rx is None:
-            raise DiscoveryError(f"Lian Li wireless dongles not found (tx={bool(tx)} rx={bool(rx)})")
+            result = classify_discovery([], None, tx_present=bool(tx), rx_present=bool(rx))
+            raise DiscoveryError(result.message())
         claim(tx)
         claim(rx)
 
         master_mac, master_ch = discover_master(tx)
         if master_mac is None or master_ch is None:
-            raise DiscoveryError("TX dongle did not respond to GET_MAC scan")
+            raise DiscoveryError(classify_discovery([], None).message())
         LOG.info("master: %s ch=%s", master_mac.hex(":"), master_ch)
 
         frames = collect_rx_frames(rx, count=5, max_wait=5.0)
-        rec = find_aio(frames, master_mac=master_mac)
-        if rec is None:
+        result = classify_discovery(frames, master_mac)
+
+        # Optional, config-gated self-healing for the 2026-06-18 visible-but-
+        # unbound failure mode. Default config never reaches the rebind path.
+        if result.state is DiscoveryState.AIO_UNBOUND and cfg is not None:
+            eligible, reason = should_auto_rebind(result, cfg)
+            if eligible:
+                LOG.warning("auto-rebind eligible: %s", reason)
+                result = perform_auto_rebind(tx, rx, master_mac, master_ch, result.aio)
+            else:
+                LOG.warning("auto-rebind skipped: %s", reason)
+
+        if not result.ok:
+            # An unbound/foreign AIO is visible but unusable; surface its identity
+            # so logs distinguish it from "nothing on the air" and so the recovery
+            # tooling has the MAC/master/rx_type it needs.
+            if result.aio is not None:
+                LOG.warning("%s [%s]", result.message(), discovery_summary(frames, master_mac))
+            if result.state is DiscoveryState.AIO_UNBOUND:
+                LOG.warning("to recover, run: ./scripts/recover-display.sh (use --dry-run first)")
             raise DiscoveryError(
-                "no bound HydroShift/WaterBlock AIO device found "
-                f"({discovery_summary(frames, master_mac)})"
+                f"{result.message()} ({discovery_summary(frames, master_mac)})"
             )
 
         return tx, rx, {
             "master_mac": master_mac,
             "master_ch": master_ch,
-            "record": rec,
+            "record": result.aio,
         }
     except Exception:
         release(tx, "TX")
@@ -538,12 +747,91 @@ def cmd_aio_params(master_mac: bytes, master_ch: int, device_mac: bytes, rx_type
     return bytes(rf)
 
 
+def cmd_bind_aio(
+    master_mac: bytes,
+    master_ch: int,
+    device_mac: bytes,
+    current_pwm: list[int],
+    target_rx: int,
+) -> bytes:
+    """Build the RF frame that binds a visible AIO to this master.
+
+    Mirrors the upstream bind handshake used to recover the 2026-06-18
+    visible-but-unbound failure: the target master goes in bytes 8..14, the
+    target rx slot is written to both byte 14 and byte 16, and the AIO's current
+    PWM is echoed back at bytes 17..21 so the bind does not disturb fan speed.
+    """
+    if len(current_pwm) != 4:
+        raise ValueError("current_pwm must contain four slots")
+    rf = bytearray(RF_DATA_SIZE)
+    rf[0] = RF_SELECT
+    rf[1] = RF_PWM_CMD
+    rf[2:8] = device_mac
+    rf[8:14] = master_mac
+    rf[14] = clamp_int(target_rx, 0, 255, "target_rx")
+    rf[15] = master_ch
+    rf[16] = clamp_int(target_rx, 0, 255, "target_rx")
+    rf[17:21] = bytes(clamp_int(v, 0, 255, "pwm") for v in current_pwm)
+    return bytes(rf)
+
+
+def cmd_save_config(master_mac: bytes) -> bytes:
+    """Build the broadcast SaveConfig RF frame that persists the new binding.
+
+    Broadcast to ``ff:ff:ff:ff:ff:ff`` with rx ``0xff`` so the receiver commits
+    its RF config to flash regardless of which slot the AIO landed on.
+    """
+    rf = bytearray(RF_DATA_SIZE)
+    rf[0] = RF_SELECT
+    rf[1] = RF_SAVE_CONFIG
+    rf[2:8] = BROADCAST_MAC
+    rf[8:14] = master_mac
+    rf[14] = BROADCAST_RX
+    return bytes(rf)
+
+
 def send_master_clock(tx, master_mac: bytes, master_ch: int) -> None:
     rf = bytearray(RF_DATA_SIZE)
     rf[0] = RF_SELECT
     rf[1] = RF_MASTER_CLOCK
     rf[8:14] = master_mac
     send_rf_chunks(tx, bytes(rf), packet_channel=master_ch, packet_rx_type=0xFF)
+
+
+def perform_auto_rebind(
+    tx,
+    rx,
+    master_mac: bytes,
+    master_ch: int,
+    aio: dict[str, Any],
+    target_rx: int = AUTO_REBIND_TARGET_RX,
+) -> DiscoveryResult:
+    """Bind a visible unbound AIO to this master, then persist and re-discover.
+
+    Mirrors the manual recover-display flow but bounded: repeatedly send the bind
+    frame, re-classify, and on success broadcast SaveConfig. Returns the final
+    DiscoveryResult so the caller can proceed only if it is now bound.
+    """
+    LOG.warning(
+        "auto-rebinding visible unbound AIO %s -> master %s rx=%s",
+        aio["mac"].hex(":"), master_mac.hex(":"), target_rx,
+    )
+    bind_rf = cmd_bind_aio(master_mac, master_ch, aio["mac"], aio["current_pwm"], target_rx)
+    save_rf = cmd_save_config(master_mac)
+    deadline = time.time() + 8.0
+    while running and time.time() < deadline:
+        for _ in range(6):
+            send_rf_frame(tx, bind_rf, aio["channel"], aio["rx_type"])
+            time.sleep(0.03)
+        result = classify_discovery(collect_rx_frames(rx, count=5, max_wait=4.0), master_mac)
+        if result.ok:
+            for _ in range(3):
+                send_rf_frame(tx, save_rf, master_ch, BROADCAST_RX)
+                time.sleep(0.2)
+            LOG.info("auto-rebind converged; RF config saved")
+            return result
+    LOG.warning("auto-rebind did not converge before timeout")
+    return classify_discovery(collect_rx_frames(rx, count=5, max_wait=5.0), master_mac)
 
 
 # ---------- Wireless RGB / OpenRGB bridge helpers ----------
@@ -901,7 +1189,21 @@ def load_config(path: str | os.PathLike[str] | None) -> dict[str, Any]:
         25,
         "usb_error_reconnect_threshold",
     )
+    cfg["auto_rebind_visible_aio"] = bool(cfg.get("auto_rebind_visible_aio", False))
+    cfg["auto_rebind_allow_list"] = normalize_mac_list(cfg.get("auto_rebind_allow_list", []))
     return cfg
+
+
+def normalize_mac_list(value: Any) -> list[str]:
+    """Normalize an allow-list of MACs to lowercase colon-separated strings."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    macs: list[str] = []
+    for item in value:
+        mac = str(item).strip().lower().replace("-", ":")
+        if mac:
+            macs.append(mac)
+    return macs
 
 
 def write_default_config(path: str | os.PathLike[str]) -> None:
@@ -1134,6 +1436,264 @@ def run_theme_scan(
             time.sleep(1.0)
 
 
+# ---------- Doctor / health report ----------
+
+DEFAULT_LOG_DIR = os.path.expanduser("~/Library/Logs/lianli-hydroshift")
+LAUNCHD_LABEL = "com.suraj.lianli-hydroshift"
+
+# How long telemetry may go unseen in the log before we treat it as stale. This
+# is generous relative to the control-loop log cadence so a momentary gap does
+# not flap the verdict.
+DOCTOR_TELEMETRY_STALE_S = 120.0
+
+
+class HealthStatus(enum.Enum):
+    HEALTHY = "healthy"
+    DISCONNECTED = "disconnected"
+    DAEMON_DOWN = "daemon_down"
+    UNBOUND = "unbound"
+    STALE = "stale"
+    RGB_NOT_APPLIED = "rgb_not_applied"
+    UNKNOWN = "unknown"
+
+
+# Substrings of the explicit discovery log messages (see DiscoveryResult.message
+# and connect_hydroshift), mapped to the state they indicate. Order matters:
+# more specific phrases first.
+_DISCOVERY_LOG_MARKERS = [
+    ("AIO visible but unbound", DiscoveryState.AIO_UNBOUND),
+    ("AIO visible but bound to a different master", DiscoveryState.AIO_FOREIGN),
+    ("no HydroShift/WaterBlock AIO records visible", DiscoveryState.NO_AIO_RECORDS),
+    ("TX wireless dongle not found", DiscoveryState.TX_MISSING),
+    ("RX wireless dongle not found", DiscoveryState.RX_MISSING),
+    ("GET_MAC", DiscoveryState.MASTER_UNKNOWN),
+    ("entering control loop", DiscoveryState.AIO_BOUND),
+]
+
+
+def _parse_log_timestamp(line: str) -> datetime | None:
+    """Parse the leading ``asctime`` of a basicConfig-formatted log line."""
+    # Format: "YYYY-MM-DD HH:MM:SS,mmm LEVEL message"
+    parts = line.split(None, 2)
+    if len(parts) < 2:
+        return None
+    stamp = f"{parts[0]} {parts[1]}"
+    for fmt in ("%Y-%m-%d %H:%M:%S,%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(stamp, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_last_telemetry(text: str) -> tuple[datetime | None, str | None]:
+    """Return (timestamp, telemetry_state) of the most recent telemetry line."""
+    for line in reversed(text.splitlines()):
+        if "telemetry=" in line and "coolant=" in line:
+            state = None
+            for token in line.split():
+                if token.startswith("telemetry="):
+                    state = token.split("=", 1)[1]
+                    break
+            return _parse_log_timestamp(line), state
+    return None, None
+
+
+def parse_recent_discovery_state(text: str) -> DiscoveryState | None:
+    """Classify the most recent discovery-related log line, newest first."""
+    for line in reversed(text.splitlines()):
+        for marker, state in _DISCOVERY_LOG_MARKERS:
+            if marker in line:
+                return state
+    return None
+
+
+def parse_last_rgb_applied(text: str) -> datetime | None:
+    """Timestamp of the most recent successful OpenRGB frame apply, if any.
+
+    Matches both the first-apply and cached re-send log lines.
+    """
+    for line in reversed(text.splitlines()):
+        if "OpenRGB RGB frame" in line:
+            return _parse_log_timestamp(line)
+    return None
+
+
+def parse_last_daemon_start(text: str) -> datetime | None:
+    """Timestamp of the most recent daemon start line, if present."""
+    for line in reversed(text.splitlines()):
+        if "lianli-hydroshift daemon starting" in line:
+            return _parse_log_timestamp(line)
+    return None
+
+
+def read_daemon_log() -> str:
+    """Read the daemon log (stderr first, where logging writes, then stdout)."""
+    for name in (f"{LAUNCHD_LABEL}.err", f"{LAUNCHD_LABEL}.log"):
+        path = os.path.join(DEFAULT_LOG_DIR, name)
+        try:
+            with open(path, "r", errors="replace") as fh:
+                # Only the tail matters; avoid loading a huge rotated log.
+                return fh.read()[-200_000:]
+        except OSError:
+            continue
+    return ""
+
+
+def usb_presence() -> dict[str, bool]:
+    """Non-invasive presence check (enumeration only, no claim)."""
+
+    def present(ids: list[tuple[int, int]]) -> bool:
+        if usb_core is None:
+            return False
+        return any(usb_core.find(idVendor=v, idProduct=p) is not None for v, p in ids)
+
+    return {
+        "tx": present(TX_IDS),
+        "rx": present(RX_IDS),
+        "lcd": present(LCD_IDS),
+    }
+
+
+def tcp_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def process_running(pattern: str) -> bool:
+    """Return whether another process matching pattern is running.
+
+    The doctor itself is launched as ``python -m lianli_hydroshift.daemon --doctor``,
+    so exclude our own PID to avoid reporting the daemon as running when only the
+    doctor process matches the module name.
+    """
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-f", pattern], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if proc.returncode != 0:
+        return False
+    current_pid = os.getpid()
+    for line in proc.stdout.splitlines():
+        try:
+            if int(line.strip()) != current_pid:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def classify_health(
+    *,
+    tx_present: bool,
+    rx_present: bool,
+    daemon_running: bool,
+    telemetry_age_s: float | None,
+    discovery_state: DiscoveryState | None,
+    openrgb_port_open: bool,
+    rgb_applied: bool,
+) -> tuple[HealthStatus, str]:
+    """Classify overall health and suggest the next safe action.
+
+    Precedence mirrors what must be fixed first: hardware, then the service, then
+    the AIO binding, then telemetry, then RGB. Returns ``(status, action)``.
+    """
+    if not tx_present or not rx_present:
+        missing = " and ".join(n for n, ok in (("TX", tx_present), ("RX", rx_present)) if not ok)
+        return (
+            HealthStatus.DISCONNECTED,
+            f"{missing} dongle missing — reseat/replug the USB dongle, then re-run.",
+        )
+    if discovery_state is DiscoveryState.AIO_UNBOUND:
+        return (
+            HealthStatus.UNBOUND,
+            "AIO visible but unbound — run ./scripts/recover-display.sh "
+            "(use --dry-run first to confirm the plan).",
+        )
+    if not daemon_running:
+        return (
+            HealthStatus.DAEMON_DOWN,
+            "Daemon not running — sudo launchctl kickstart -k "
+            f"system/{LAUNCHD_LABEL}",
+        )
+    if telemetry_age_s is None or telemetry_age_s > DOCTOR_TELEMETRY_STALE_S:
+        return (
+            HealthStatus.STALE,
+            "No fresh telemetry — check the daemon log; if persistent, "
+            f"sudo launchctl kickstart -k system/{LAUNCHD_LABEL}",
+        )
+    if not openrgb_port_open or not rgb_applied:
+        return (
+            HealthStatus.RGB_NOT_APPLIED,
+            "Cooling is healthy but RGB is not applied — start/reload OpenRGB "
+            "with ~/.config/OpenRGB/MacOS.orp (LaunchAgent org.openrgb).",
+        )
+    return (HealthStatus.HEALTHY, "All checks passed.")
+
+
+def run_doctor(config_path: str) -> int:
+    """Gather health signals, print a report, and return 0 if healthy else 1."""
+    presence = usb_presence()
+    log_text = read_daemon_log()
+    now = datetime.now()
+
+    ts, telemetry_state = parse_last_telemetry(log_text)
+    telemetry_age_s = (now - ts).total_seconds() if ts is not None else None
+    discovery_state = parse_recent_discovery_state(log_text)
+    rgb_ts = parse_last_rgb_applied(log_text)
+    daemon_start_ts = parse_last_daemon_start(log_text)
+    rgb_applied_this_run = rgb_ts is not None and (
+        daemon_start_ts is None or rgb_ts >= daemon_start_ts
+    )
+    daemon_running = process_running("lianli_hydroshift.daemon")
+
+    try:
+        cfg = load_config(config_path)
+        host, port = cfg["openrgb_host"], cfg["openrgb_port"]
+    except Exception:
+        host, port = "127.0.0.1", 6743
+    port_open = tcp_port_open(host, port)
+    openrgb_running = process_running("OpenRGB.app/Contents/MacOS/OpenRGB")
+
+    def yn(ok: bool) -> str:
+        return "ok" if ok else "MISSING"
+
+    print("== Lian Li HydroShift doctor ==")
+    print(f"  USB TX dongle : {yn(presence['tx'])}")
+    print(f"  USB RX dongle : {yn(presence['rx'])}")
+    print(f"  LCD direct USB: {'present' if presence['lcd'] else 'absent (normal when wireless theme is active)'}")
+    print(f"  Daemon process: {'running' if daemon_running else 'NOT running'}")
+    if telemetry_age_s is not None:
+        print(f"  Telemetry     : {telemetry_state} (last seen {telemetry_age_s:.0f}s ago)")
+    else:
+        print("  Telemetry     : none found in log")
+    if discovery_state is not None:
+        print(f"  Discovery     : {discovery_state.value}")
+    print(f"  OpenRGB bridge: {'reachable' if port_open else 'closed'} ({host}:{port})")
+    print(f"  OpenRGB app   : {'running' if openrgb_running else 'not running'}")
+    if rgb_ts is not None:
+        print(f"  Last RGB frame: {(now - rgb_ts).total_seconds():.0f}s ago")
+
+    status, action = classify_health(
+        tx_present=presence["tx"],
+        rx_present=presence["rx"],
+        daemon_running=daemon_running,
+        telemetry_age_s=telemetry_age_s,
+        discovery_state=discovery_state,
+        openrgb_port_open=port_open,
+        rgb_applied=rgb_applied_this_run,
+    )
+    print()
+    print(f"  STATUS: {status.value.upper()}")
+    print(f"  ACTION: {action}")
+    return 0 if status is HealthStatus.HEALTHY else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Control a Lian Li HydroShift II wireless AIO")
     default_cfg = os.path.expanduser("~/.config/lianli-hydroshift/config.json")
@@ -1143,10 +1703,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scan-themes", nargs=2, type=int, metavar=("START", "END"), help="send theme indexes in sequence for discovery")
     parser.add_argument("--theme-dwell-s", type=float, default=3.0)
     parser.add_argument("--set-theme", type=int, metavar="N", help="update theme_index in config and exit")
+    parser.add_argument("--doctor", action="store_true", help="print a health report and exit")
     args = parser.parse_args(argv)
 
     setup_logging(args.log_level)
     setup_signals()
+
+    if args.doctor:
+        return run_doctor(args.config)
 
     if args.write_default_config:
         write_default_config(args.config)
@@ -1175,6 +1739,9 @@ def main(argv: list[str] | None = None) -> int:
     LOG.info("theme=%s brightness=%s rotation=%s", cfg["theme_index"], cfg["brightness"], cfg["rotation"])
 
     global reload_requested
+    # Survives reconnects/rebinds so the cooler can be restored to the last known
+    # OpenRGB colours without waiting for the client to push a fresh frame.
+    last_rgb_frame: list[tuple[int, int, int]] | None = None
     while running:
         tx = rx = None
         openrgb_bridge: OpenRgbBridge | None = None
@@ -1187,7 +1754,7 @@ def main(argv: list[str] | None = None) -> int:
                     LOG.warning("config reload failed, keeping previous config: %s", exc)
                 reload_requested = False
 
-            tx, rx, session = connect_hydroshift()
+            tx, rx, session = connect_hydroshift(cfg)
             master_mac = session["master_mac"]
             master_ch = session["master_ch"]
             rec = session["record"]
@@ -1241,6 +1808,12 @@ def main(argv: list[str] | None = None) -> int:
                     port=cfg["openrgb_port"],
                 )
                 openrgb_bridge.start()
+                if last_rgb_frame is not None:
+                    openrgb_bridge.prime_frame(last_rgb_frame)
+                    LOG.info(
+                        "primed OpenRGB bridge with cached %s-LED frame for re-send",
+                        len(last_rgb_frame),
+                    )
 
             LOG.info("entering control loop")
             last_log = 0.0
@@ -1266,6 +1839,8 @@ def main(argv: list[str] | None = None) -> int:
                                 port=cfg["openrgb_port"],
                             )
                             openrgb_bridge.start()
+                            if last_rgb_frame is not None:
+                                openrgb_bridge.prime_frame(last_rgb_frame)
                     except Exception as exc:
                         LOG.warning("config reload failed, keeping previous config: %s", exc)
                     reload_requested = False
@@ -1380,6 +1955,7 @@ def main(argv: list[str] | None = None) -> int:
                 if openrgb_bridge is not None:
                     rgb_frame = openrgb_bridge.take_pending_frame()
                     if rgb_frame is not None:
+                        is_resend = rgb_frame == last_rgb_frame
                         try:
                             send_rgb_direct(
                                 tx,
@@ -1390,7 +1966,13 @@ def main(argv: list[str] | None = None) -> int:
                                 colors=rgb_frame,
                                 tinyuz_library=cfg["tinyuz_library"],
                             )
-                            LOG.info("applied OpenRGB RGB frame: %s LEDs", len(rgb_frame))
+                            # Cache the last successfully sent frame so it can be
+                            # re-applied after a reconnect/rebind.
+                            last_rgb_frame = rgb_frame
+                            if is_resend:
+                                LOG.info("re-applied cached OpenRGB RGB frame: %s LEDs", len(rgb_frame))
+                            else:
+                                LOG.info("applied OpenRGB RGB frame: %s LEDs", len(rgb_frame))
                         except (USB_ERROR, OSError) as exc:
                             usb_failures += 1
                             LOG.warning(

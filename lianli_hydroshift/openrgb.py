@@ -97,6 +97,10 @@ class OpenRgbBridge:
             [(255, 255, 255)] * zone.led_count for zone in device.zones
         ]
         self._dirty = False
+        # Whether a real client frame has ever been applied (vs the default white
+        # state). Used so we only re-apply cached colours we actually received.
+        self._received_frame = False
+        self._served_controller_data = False
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -119,12 +123,32 @@ class OpenRgbBridge:
             self._thread.join(timeout=timeout)
         self.running = False
 
+    @property
+    def has_received_frame(self) -> bool:
+        with self._lock:
+            return self._received_frame
+
     def take_pending_frame(self) -> list[Color] | None:
         with self._lock:
             if not self._dirty:
                 return None
             self._dirty = False
             return [color for zone in self._zone_colors for color in zone]
+
+    def prime_frame(self, colors: Iterable[Color]) -> None:
+        """Seed the bridge with a previously applied frame and queue it for re-send.
+
+        Used after a daemon reconnect/rebind, USB reopen, or wireless-theme
+        re-engage so the cooler is restored to the last known OpenRGB colours
+        without waiting for the client to push a fresh update.
+        """
+        color_list = [(clamp_color(r), clamp_color(g), clamp_color(b)) for r, g, b in colors]
+        if not color_list:
+            return
+        with self._lock:
+            self._zone_colors = split_zones(color_list, self.device.zones)
+            self._received_frame = True
+            self._dirty = True
 
     def set_all_colors(self, colors: Iterable[Color]) -> None:
         color_list = [(clamp_color(r), clamp_color(g), clamp_color(b)) for r, g, b in colors]
@@ -133,6 +157,7 @@ class OpenRgbBridge:
         with self._lock:
             self._zone_colors = split_zones(color_list, self.device.zones)
             self._dirty = True
+            self._received_frame = True
 
     def set_zone_colors(self, zone_idx: int, colors: Iterable[Color]) -> None:
         color_list = [(clamp_color(r), clamp_color(g), clamp_color(b)) for r, g, b in colors]
@@ -144,6 +169,7 @@ class OpenRgbBridge:
                 color_list.extend([self._zone_colors[zone_idx][-1] if self._zone_colors[zone_idx] else (0, 0, 0)] * (zone_len - len(color_list)))
             self._zone_colors[zone_idx] = color_list[:zone_len]
             self._dirty = True
+            self._received_frame = True
 
     def set_single_led(self, led_idx: int, color: Color) -> None:
         with self._lock:
@@ -156,6 +182,7 @@ class OpenRgbBridge:
                         clamp_color(color[2]),
                     )
                     self._dirty = True
+                    self._received_frame = True
                     return
                 offset += zone.led_count
 
@@ -234,6 +261,13 @@ class OpenRgbBridge:
             self._send_packet(conn, 0, PKT_REQUEST_CONTROLLER_COUNT, struct.pack("<I", 1))
         elif pkt_id == PKT_REQUEST_CONTROLLER_DATA:
             data = self._build_controller_data() if dev_idx == 0 else b""
+            if dev_idx == 0 and not self._served_controller_data:
+                self._served_controller_data = True
+                LOG.info(
+                    "OpenRGB profile matched device: %s (serial wireless:%s)",
+                    self.device.name,
+                    self.device.serial,
+                )
             self._send_packet(conn, dev_idx, PKT_REQUEST_CONTROLLER_DATA, data)
         elif pkt_id == PKT_SET_CUSTOM_MODE:
             return

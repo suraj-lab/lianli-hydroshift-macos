@@ -59,5 +59,7 @@
   "openrgb_port": 6743,
   "tinyuz_library": "",
   "discovery_retry_interval_s": 30.0,
-  "usb_error_reconnect_threshold": 3
+  "usb_error_reconnect_threshold": 3,
+  "auto_rebind_visible_aio": false,
+  "auto_rebind_allow_list": []
 }
