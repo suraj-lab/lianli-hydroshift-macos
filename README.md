@@ -313,7 +313,20 @@ Logs:
 ~/Library/Logs/lianli-hydroshift/com.suraj.lianli-hydroshift.err
 ```
 
-Security note: the LaunchDaemon runs code from this project path. For a more locked-down production setup, copy the project to a root-owned location such as `/Library/Application Support/LianLiHydroShift` before installing the LaunchDaemon.
+Security: to decouple the daemon from the project checkout, use the hardened runtime install:
+
+```bash
+cd ~/Projects/lianli-hydroshift-macos
+# Copy code + venv to /Library/Application Support/LianLiHydroShift/ and
+# point the LaunchDaemon there. Config and logs stay user-owned.
+./scripts/install-runtime.sh
+```
+
+Revert to the checkout path:
+
+```bash
+./scripts/uninstall-runtime.sh
+```
 
 ## Optional LaunchAgent
 

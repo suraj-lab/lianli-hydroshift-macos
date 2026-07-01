@@ -187,25 +187,31 @@ Next tasks:
 ./scripts/set-theme.sh 7 --reload
 ```
 
-## Milestone 6 — Packaging / hardening ⏳
+## Milestone 6 — Packaging / hardening ✅
 
-Status: planned.
+Status: complete.
 
-Current caveat:
+Previously the LaunchDaemon ran code directly from the project checkout under
+`~/Projects/`. Now runtime files are installed into a root-owned path:
 
-- LaunchDaemon runs code directly from the project checkout under `~/Projects`.
+- Runtime: `/Library/Application Support/LianLiHydroShift/`
+- Virtual environment: `/Library/Application Support/LianLiHydroShift/.venv/`
+- Config: `~/.config/lianli-hydroshift/config.json` (unchanged, user-owned)
+- Logs: `~/Library/Logs/lianli-hydroshift/` (unchanged, user-owned)
+- Persisted RGB frame: `~/.config/lianli-hydroshift/last_rgb_frame.json`
 
-Possible improvements:
+Completed:
 
-- Install runtime files into a root-owned path:
-  - `/Library/Application Support/LianLiHydroShift/`
-- Keep config in:
-  - `/Users/suraj/.config/lianli-hydroshift/config.json`
-- Keep logs in:
-  - `/Users/suraj/Library/Logs/lianli-hydroshift/`
-- Add `scripts/install-runtime.sh` to copy code/venv safely.
-- Consider a lightweight `.app` wrapper only for config/status UX.
-- Consider code signing later if distributing beyond this machine.
+- `scripts/install-runtime.sh` — copies source, creates venv, builds tinyuz
+  library, installs/reloads the LaunchDaemon pointing at the hardened paths.
+- `scripts/uninstall-runtime.sh` — reverts to the project-checkout path.
+- `scripts/render-plist.py` — now accepts `--project-dir` so the plist can be
+  generated for any install location.
+
+Not done yet (future):
+
+- Lightweight `.app` wrapper for config/status UX.
+- Code signing for distribution beyond this machine.
 
 ## Milestone 7 — OpenRGB / lighting integration ✅
 

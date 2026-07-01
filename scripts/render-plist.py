@@ -14,10 +14,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("template")
     parser.add_argument("output")
+    parser.add_argument("--project-dir", default=None,
+                        help="path to the project root (default: parent of scripts/)")
     parser.add_argument("--log-dir", default=None)
     args = parser.parse_args()
 
-    project = Path(__file__).resolve().parents[1]
+    project = Path(args.project_dir).resolve() if args.project_dir else Path(__file__).resolve().parents[1]
     python = project / ".venv" / "bin" / "python"
     config = Path.home() / ".config" / "lianli-hydroshift" / "config.json"
     log_dir = Path(args.log_dir).expanduser() if args.log_dir else Path.home() / "Library" / "Logs" / "lianli-hydroshift"
