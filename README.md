@@ -328,7 +328,7 @@ Use **either** LaunchDaemon or LaunchAgent, not both.
 
 ## Theme discovery
 
-`theme_index` is configurable. Upstream clamps to 12, but this project defaults `theme_index_max` to 31 so we can probe higher values.
+`theme_index` is configurable. Valid range is **0–12**. Indexes 13+ corrupt the display controller firmware with no software recovery path on any OS (see the display recovery incident in [`MILESTONES.md`](./MILESTONES.md)). The daemon hard-clamps `theme_index_max` to 12 and the config default matches.
 
 Current selected theme:
 
@@ -336,16 +336,15 @@ Current selected theme:
 theme_index = 5
 ```
 
-Manual scan example:
+Switch to a discovered theme using the helper:
 
 ```bash
-.venv/bin/python -m lianli_hydroshift.daemon \
-  --config ~/.config/lianli-hydroshift/config.json \
-  --scan-themes 0 31 \
-  --theme-dwell-s 4
+./scripts/set-theme.sh <N> [--reload]
 ```
 
-Watch the LCD/pump display and note which indexes are valid/interesting.
+(`--reload` sends SIGHUP to the running daemon so the change takes effect without a full restart.)
+
+Do **not** use the auto `--scan-themes` range walk — that is what walked into the corrupting index 13 on the original display. Change one index at a time with `--set-theme` and observe.
 
 ## Validation
 
@@ -378,15 +377,23 @@ Implemented changes compared with the original prototype:
 - Keeps sending control packets through short RX telemetry gaps.
 - Staged stale telemetry handling instead of immediate full-blast failsafe.
 - Configurable pump curve or fixed RPM.
-- Configurable `theme_index_max` for theme probing.
+- Configurable `theme_index_max` (safe range 0–12; 13+ bricks the display hardware).
 - Structured logging and cleaner USB release on shutdown.
 - LaunchDaemon boot autostart with `ProcessType=Standard` and `Nice=-5`.
 
-## Next likely work
+## Current project state
 
-See [`MILESTONES.md`](./MILESTONES.md) for the roadmap. Near-term candidates:
+See [`MILESTONES.md`](./MILESTONES.md) for the full history. Completed:
 
-- Catalogue valid theme indexes.
-- Add a small command helper for theme changes without editing JSON.
-- Package/harden the daemon into a root-owned install location.
-- Investigate OpenRGB integration for lighting control.
+- ✅ Boot-time LaunchDaemon with fan/pump coolant-temperature control.
+- ✅ Telemetry smoothing, stale handling, and slew limiting.
+- ✅ OpenRGB SDK bridge with tinyuz compression and full RGB profile support.
+- ✅ Recovery tooling (`doctor.sh`, `recover-display.sh`, `reapply-openrgb-profile.sh`).
+- ✅ Guarded auto-rebind for the unbound-AIO boot failure mode.
+- ✅ Theme helper: `./scripts/set-theme.sh N [--reload]`.
+
+Remaining work, in rough order:
+
+1. Catalogue safe theme indexes (0–12) one at a time with `--set-theme`.
+2. Package/harden the daemon into a root-owned install location (`/Library/Application Support/`).
+3. Plan the native macOS menu-bar app (post-RMA replacement display).

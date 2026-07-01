@@ -24,7 +24,7 @@ import time
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
 from .openrgb import OpenRgbBridge, OpenRgbDevice, OpenRgbZone
 
@@ -597,8 +597,9 @@ def should_auto_rebind(
         return False, "auto_rebind_visible_aio is disabled"
     if result.state is not DiscoveryState.AIO_UNBOUND:
         return False, f"state {result.state.value} is not auto-rebindable"
-    if len(result.aio_records) != 1:
-        return False, f"expected exactly one visible AIO, found {len(result.aio_records)}"
+    aio_macs = {r["mac"] for r in result.aio_records}
+    if len(aio_macs) != 1:
+        return False, f"expected exactly one visible AIO, found {len(aio_macs)}"
     aio = result.aio
     if aio is None or aio["master_mac"] != ZERO_MAC:
         return False, "AIO is not unbound (master is not all-zero)"
@@ -1194,6 +1195,41 @@ def load_config(path: str | os.PathLike[str] | None) -> dict[str, Any]:
     return cfg
 
 
+def _rgb_frame_path(config_path: str) -> Path:
+    """Derive the persisted RGB frame path next to the daemon config."""
+    config_dir = Path(config_path).parent
+    return config_dir / "last_rgb_frame.json"
+
+
+def save_rgb_frame(config_path: str, frame: Sequence[Color]) -> None:
+    """Persist the last successfully sent OpenRGB frame so it survives restarts."""
+    path = _rgb_frame_path(config_path)
+    data = [[r, g, b] for r, g, b in frame]
+    try:
+        path.write_text(json.dumps(data))
+    except OSError as exc:
+        LOG.warning("failed to save RGB frame to %s: %s", path, exc)
+
+
+def load_rgb_frame(config_path: str) -> list[Color] | None:
+    """Load a previously persisted RGB frame, or None."""
+    path = _rgb_frame_path(config_path)
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text())
+        if not isinstance(raw, list) or not raw:
+            return None
+        colors = [(int(r), int(g), int(b)) for r, g, b in raw]
+        if not colors:
+            return None
+        LOG.info("loaded persisted RGB frame from %s: %s LEDs", path, len(colors))
+        return colors
+    except (json.JSONDecodeError, ValueError, TypeError, KeyError) as exc:
+        LOG.warning("ignoring corrupt RGB frame %s: %s", path, exc)
+        return None
+
+
 def normalize_mac_list(value: Any) -> list[str]:
     """Normalize an allow-list of MACs to lowercase colon-separated strings."""
     if not isinstance(value, (list, tuple)):
@@ -1741,7 +1777,8 @@ def main(argv: list[str] | None = None) -> int:
     global reload_requested
     # Survives reconnects/rebinds so the cooler can be restored to the last known
     # OpenRGB colours without waiting for the client to push a fresh frame.
-    last_rgb_frame: list[tuple[int, int, int]] | None = None
+    # Also persisted to disk so it survives a full daemon restart (cold boot).
+    last_rgb_frame: list[tuple[int, int, int]] | None = load_rgb_frame(args.config)
     while running:
         tx = rx = None
         openrgb_bridge: OpenRgbBridge | None = None
@@ -1967,8 +2004,9 @@ def main(argv: list[str] | None = None) -> int:
                                 tinyuz_library=cfg["tinyuz_library"],
                             )
                             # Cache the last successfully sent frame so it can be
-                            # re-applied after a reconnect/rebind.
+                            # re-applied after a reconnect/rebind or cold boot.
                             last_rgb_frame = rgb_frame
+                            save_rgb_frame(args.config, rgb_frame)
                             if is_resend:
                                 LOG.info("re-applied cached OpenRGB RGB frame: %s LEDs", len(rgb_frame))
                             else:

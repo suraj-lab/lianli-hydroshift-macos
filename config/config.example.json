@@ -50,7 +50,7 @@
   "failsafe_pwm": 160,
   "failsafe_pump_rpm": 2800,
   "theme_index": 5,
-  "theme_index_max": 31,
+  "theme_index_max": 12,
   "brightness": 80,
   "rotation": 0,
   "send_master_clock": false,

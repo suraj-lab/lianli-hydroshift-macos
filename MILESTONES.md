@@ -6,14 +6,17 @@ Purpose: native-ish macOS/Hackintosh control of the Lian Li HydroShift II wirele
 
 ## Status summary
 
-As of 2026-06-04:
+As of 2026-07-01:
 
 - The daemon works on Suraj's Hackintosh.
 - It runs persistently at macOS boot via LaunchDaemon.
 - Fan and pump control are coolant-temperature based.
-- Theme index 5 is selected in the live config.
+- OpenRGB SDK bridge with full RGB profile support (tinyuz compression, cached frame re-send).
+- Guarded auto-rebind recovers from the unbound-AIO boot failure mode.
+- `doctor.sh` provides one-command health classification.
+- Theme index 5 is selected; theme helper (`set-theme.sh`) is available.
 - Load-test tuning is accepted as good enough for daily use.
-- OpenRGB / lighting work has not started yet.
+- Replacement display still pending from Lian Li RMA.
 
 ## Milestone 0 — Reverse engineering / proof of concept ✅
 
@@ -165,14 +168,11 @@ Completed:
 
 Next tasks:
 
-- Run a systematic scan:
+- Document themes using **one index at a time** — do **not** use `--scan-themes`
+  (that range walk is what probed the unsafe index 13 on the original display):
 
 ```bash
-cd ~/Projects/lianli-hydroshift-macos
-.venv/bin/python -m lianli_hydroshift.daemon \
-  --config ~/.config/lianli-hydroshift/config.json \
-  --scan-themes 0 31 \
-  --theme-dwell-s 4
+./scripts/set-theme.sh N --reload
 ```
 
 - Record visible behavior per index:
@@ -207,30 +207,27 @@ Possible improvements:
 - Consider a lightweight `.app` wrapper only for config/status UX.
 - Consider code signing later if distributing beyond this machine.
 
-## Milestone 7 — OpenRGB / lighting integration ⏳
+## Milestone 7 — OpenRGB / lighting integration ✅
 
-Status: planned / research needed.
+Status: complete. Implemented via an OpenRGB SDK bridge that runs inside the
+daemon, avoiding any contention over the USB dongles.
 
-Goal:
+Completed:
 
-- Explore whether HydroShift II wireless lighting can be exposed to OpenRGB or coordinated with it.
+- OpenRGB SDK server embedded in the daemon (config key: `openrgb_server`).
+- OpenRGB connects as a TCP client to `127.0.0.1:6743`.
+- Device exposed to OpenRGB as "HydroShift II LCD-S (Wireless)", serial `wireless:<aio-mac>`.
+- tinyuz compression bridge (`libtinyuz.dylib`) for direct RGB packet encoding.
+- Cached RGB frame re-send on daemon reconnect (survives rebinds/USB reopens).
+- `scripts/reapply-openrgb-profile.sh` reloads the OpenRGB profile into the bridge.
+- `scripts/install-openrgb-launchagent.sh` / `scripts/uninstall-openrgb-launchagent.sh`
+- OpenRGB process and bridge port state are reported by `doctor.sh`.
 
-Open questions:
+Known limitation:
 
-- Does OpenRGB have a suitable plugin/device model for this wireless RF path?
-- Should integration be direct OpenRGB support, an OpenRGB plugin, or a bridge process?
-- Which lighting surfaces are controllable independently?
-  - pump head LEDs
-  - LCD theme / brightness / rotation
-  - fan LEDs if attached through the wireless group
-- How to avoid contention between this daemon and OpenRGB over the TX dongle?
-
-Likely next steps:
-
-1. Catalogue available theme/RGB commands from `lian-li-linux`.
-2. Determine whether RGB packet format is stable for HydroShift II.
-3. Prototype one static RGB command from this daemon or a separate test script.
-4. Only then consider OpenRGB integration.
+- After a daemon reconnect (rebind/USB reopen), the cached frame is primed and
+  re-sent, but sometimes the OpenRGB client still needs a manual profile re-kick
+  via `./scripts/reapply-openrgb-profile.sh`.
 
 ## Milestone 8 — Recovery and self-healing hardening ✅
 
@@ -564,10 +561,9 @@ Daily-driver state is accepted for now:
 
 Next recommended work, in order:
 
-1. ~~Finish Milestone 8 recovery/self-healing hardening.~~ ✅ Done (8.1–8.6).
-2. Use the system normally and observe logs/noise for a few days; run
+1. Use the system normally and observe logs/noise for a few days; run
    `./scripts/doctor.sh` if anything looks off.
-3. Catalogue safe theme indexes only within the verified guardrail range, once
-   the RMA replacement display arrives.
-4. Harden install location (Milestone 6) if this becomes permanent.
-5. Continue native macOS app planning.
+2. Catalogue safe theme indexes only within the verified 0–12 range, one index
+   at a time with `--set-theme N --reload`. Do **not** run `--scan-themes`.
+3. Harden install location (Milestone 6) if this becomes permanent.
+4. Continue native macOS app planning (Milestone 9).

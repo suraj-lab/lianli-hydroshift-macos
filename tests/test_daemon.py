@@ -443,6 +443,16 @@ class AutoRebindTests(unittest.TestCase):
         self.assertTrue(eligible)
         self.assertIn(DEVICE.hex(":"), reason)
 
+    def test_eligible_with_duplicate_records_for_same_unbound_aio(self):
+        # collect_rx_frames samples multiple frames; the same visible AIO can
+        # appear once per frame. That is still one physical AIO and should be
+        # auto-rebindable.
+        frame = self._frame(record(master=self.ZERO, device=DEVICE))
+        result = d.classify_discovery([frame, frame, frame], MASTER)
+        eligible, reason = d.should_auto_rebind(result, self._cfg())
+        self.assertTrue(eligible)
+        self.assertIn(DEVICE.hex(":"), reason)
+
     def test_not_eligible_for_bound_state(self):
         frame = self._frame(record(master=MASTER, device=DEVICE))
         bound = d.classify_discovery([frame], MASTER)
@@ -594,6 +604,49 @@ class SetThemeConfigTests(unittest.TestCase):
             path = f.name
         written = d.set_theme_in_config(path, -3)
         self.assertEqual(written, 0)
+
+
+class RgbFramePersistTests(unittest.TestCase):
+    def test_save_and_load_round_trip(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            config_path = f.name
+        try:
+            frame = [(255, 0, 128), (0, 255, 64), (10, 20, 30)]
+            d.save_rgb_frame(config_path, frame)
+            loaded = d.load_rgb_frame(config_path)
+            self.assertEqual(loaded, frame)
+            # File is next to config, not config itself.
+            persist_path = d._rgb_frame_path(config_path)
+            self.assertTrue(persist_path.exists())
+            self.assertNotEqual(str(persist_path), str(config_path))
+        finally:
+            d._rgb_frame_path(config_path).unlink(missing_ok=True)
+
+    def test_load_returns_none_when_no_file_exists(self):
+        result = d.load_rgb_frame("/nonexistent/path/to/config.json")
+        self.assertIsNone(result)
+
+    def test_load_returns_none_for_corrupt_json(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            config_path = f.name
+        try:
+            persist_path = d._rgb_frame_path(config_path)
+            persist_path.write_text("not json")
+            result = d.load_rgb_frame(config_path)
+            self.assertIsNone(result)
+        finally:
+            persist_path.unlink(missing_ok=True)
+
+    def test_load_returns_none_for_empty_list(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            config_path = f.name
+        try:
+            persist_path = d._rgb_frame_path(config_path)
+            persist_path.write_text("[]")
+            result = d.load_rgb_frame(config_path)
+            self.assertIsNone(result)
+        finally:
+            persist_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
