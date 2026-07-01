@@ -1577,12 +1577,33 @@ def read_daemon_log() -> str:
 
 
 def usb_presence() -> dict[str, bool]:
-    """Non-invasive presence check (enumeration only, no claim)."""
+    """Non-invasive presence check (enumeration only, no claim).
+
+    On macOS, pyusb may not see devices claimed by another process (the running
+    daemon). Fall back to system_profiler when pyusb returns False.
+    """
+    import subprocess
 
     def present(ids: list[tuple[int, int]]) -> bool:
         if usb_core is None:
             return False
-        return any(usb_core.find(idVendor=v, idProduct=p) is not None for v, p in ids)
+        # Try pyusb first — fast path when devices are visible.
+        if any(usb_core.find(idVendor=v, idProduct=p) is not None for v, p in ids):
+            return True
+        # Fall back to system_profiler on macOS (catches devices held by a kernel
+        # driver or already claimed by another libusb process).
+        try:
+            output = subprocess.run(
+                ["system_profiler", "SPUSBDataType"],
+                capture_output=True, text=True, timeout=5.0,
+            ).stdout
+            for vid, pid in ids:
+                # system_profiler shows "Product ID: 0x{p:04x}" and "Vendor ID: 0x{v:04x}"
+                if f"Product ID: 0x{pid:04x}" in output and f"Vendor ID: 0x{vid:04x}" in output:
+                    return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return False
 
     return {
         "tx": present(TX_IDS),
