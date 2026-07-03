@@ -575,6 +575,11 @@ a CLI daemon to a proper macOS app. High-level intent (to be planned in detail):
 - Keep the existing daemon as the control backend; the app talks to it.
 - Safe theme picker constrained to the verified 0–12 range.
 
+Interim (2026-07-03): `scripts/hydroshift.5s.sh` SwiftBar plugin ships the
+menu-bar essentials now — live coolant/fan/pump from the daemon log, 0–12 theme
+picker via `set-theme.sh`, doctor and restart shortcuts. The full native app
+(curve editor UI) stays gated on the replacement display.
+
 ## Known issues / observations
 
 - RX telemetry can be noisy under heavy CPU load and sometimes reports implausibly low coolant values.

@@ -161,6 +161,17 @@ USB error reconnect threshold: 3 consecutive read/write failures
 
 If macOS can see the wireless master but not the bound AIO, the daemon now stays alive, releases USB handles, and retries discovery instead of exiting and relying on launchd to respawn it. During the control loop, repeated PyUSB/libusb read/write failures trigger a clean dongle reopen.
 
+## Menu-bar stats (SwiftBar)
+
+`scripts/hydroshift.5s.sh` is a [SwiftBar](https://swiftbar.app) plugin showing live coolant temp in the menu bar, with fan/pump RPM, a 0–12 theme picker, and doctor/restart shortcuts in the dropdown:
+
+```bash
+brew install --cask swiftbar   # pick a plugin folder on first launch
+ln -s ~/Projects/lianli-hydroshift-macos/scripts/hydroshift.5s.sh <plugin-folder>/
+```
+
+It only reads the daemon log — no USB access, safe to run alongside everything else.
+
 ## Troubleshooting / health check
 
 Run the doctor first — it is read-only (no RF writes, does not take the dongles) and classifies the system with a suggested next action:
