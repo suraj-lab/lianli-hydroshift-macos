@@ -5,7 +5,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from lianli_hydroshift import daemon as d
+from lianli_hydroshift import doctor as doc
 from lianli_hydroshift import openrgb as orgb
+from lianli_hydroshift.openrgb import OpenRgbDevice, OpenRgbZone
 
 
 MASTER = bytes.fromhex("010203040506")
@@ -72,13 +74,6 @@ class DaemonProtocolTests(unittest.TestCase):
         # Only one device is bound to this master in the frame, so command index is 1.
         self.assertEqual(aio["seq_index"], 1)
 
-    def test_discovery_summary_counts_unbound_records(self):
-        frame = bytes([d.USB_CMD_SEND_RF, 1, 0, 0]) + record(master=OTHER_MASTER)
-        summary = d.discovery_summary([frame], MASTER)
-        self.assertIn("frames=1", summary)
-        self.assertIn("records=1", summary)
-        self.assertIn("bound=0", summary)
-        self.assertIn(str(d.DEVICE_TYPE_WATERBLOCK2), summary)
 
     def test_connect_hydroshift_releases_handles_when_aio_missing(self):
         tx = object()
@@ -106,7 +101,7 @@ class DaemonProtocolTests(unittest.TestCase):
             ]
             with self.assertRaises(d.DiscoveryError) as cm:
                 d.connect_hydroshift()
-            self.assertIn("different master", str(cm.exception))
+            self.assertIn("not found", str(cm.exception))
             self.assertEqual(claimed, [tx, rx])
             self.assertEqual(released, [(tx, "TX"), (rx, "RX")])
         finally:
@@ -123,9 +118,9 @@ class DaemonProtocolTests(unittest.TestCase):
 
     def test_default_curves_are_quiet_then_aggressive(self):
         cfg = d.load_config(None)
-        low_pwm = d.apply_min_pwm(d.interpolate_pwm(30, cfg["fan_curve"]), cfg["min_pwm"])
-        mid_pwm = d.apply_min_pwm(d.interpolate_pwm(40, cfg["fan_curve"]), cfg["min_pwm"])
-        hot_pwm = d.apply_min_pwm(d.interpolate_pwm(50, cfg["fan_curve"]), cfg["min_pwm"])
+        low_pwm = d.apply_min_pwm(d.interpolate_value(30, cfg["fan_curve"]), cfg["min_pwm"])
+        mid_pwm = d.apply_min_pwm(d.interpolate_value(40, cfg["fan_curve"]), cfg["min_pwm"])
+        hot_pwm = d.apply_min_pwm(d.interpolate_value(50, cfg["fan_curve"]), cfg["min_pwm"])
         self.assertLess(low_pwm, 45)
         self.assertGreater(mid_pwm, low_pwm)
         self.assertEqual(hot_pwm, 255)
@@ -152,13 +147,6 @@ class DaemonProtocolTests(unittest.TestCase):
         self.assertIsNotNone(d.coolant_rejection_reason(29.0, 36.0, cfg, stale_age_s=0))
         self.assertIsNone(d.coolant_rejection_reason(29.0, 36.0, cfg, stale_age_s=90))
 
-    def test_stale_targets_are_moderate_not_full_blast(self):
-        cfg = d.load_config(None)
-        pwm, pump = d.stale_targets(30.0, 35, 1800, cfg)
-        self.assertEqual(pwm, cfg["stale_pwm"])
-        self.assertEqual(pump, cfg["stale_pump_rpm"])
-        self.assertLess(pwm, cfg["failsafe_pwm"])
-        self.assertLess(pump, cfg["failsafe_pump_rpm"])
 
     def test_rgb_direct_frame_layout_matches_wireless_protocol(self):
         compressed = bytes(range(230))
@@ -201,105 +189,6 @@ class DaemonProtocolTests(unittest.TestCase):
         self.assertEqual(d.slew_limit(35, 37, up_step=4, down_step=3), 37)
 
 
-class DiscoveryClassificationTests(unittest.TestCase):
-    ZERO = bytes(6)
-
-    def _frame(self, *records):
-        return bytes([d.USB_CMD_SEND_RF, len(records), 0, 0]) + b"".join(records)
-
-    def test_tx_missing_takes_precedence(self):
-        result = d.classify_discovery([], None, tx_present=False, rx_present=False)
-        self.assertEqual(result.state, d.DiscoveryState.TX_MISSING)
-        self.assertFalse(result.ok)
-        self.assertIn("TX", result.message())
-
-    def test_rx_missing_when_tx_present(self):
-        result = d.classify_discovery([], None, tx_present=True, rx_present=False)
-        self.assertEqual(result.state, d.DiscoveryState.RX_MISSING)
-        self.assertIn("RX", result.message())
-
-    def test_master_unknown_when_scan_fails(self):
-        result = d.classify_discovery([], None)
-        self.assertEqual(result.state, d.DiscoveryState.MASTER_UNKNOWN)
-        self.assertIn("GET_MAC", result.message())
-
-    def test_no_aio_records_when_only_non_aio_devices_visible(self):
-        frame = self._frame(record(master=MASTER, device_type=5))
-        result = d.classify_discovery([frame], MASTER)
-        self.assertEqual(result.state, d.DiscoveryState.NO_AIO_RECORDS)
-        self.assertIsNone(result.aio)
-        self.assertIn("no HydroShift", result.message())
-
-    def test_aio_unbound_when_master_all_zero(self):
-        # The 2026-06-18 failure mode: AIO visible, master 00:..:00, invalid rx.
-        unbound = record(master=self.ZERO, device=DEVICE)
-        result = d.classify_discovery([self._frame(unbound)], MASTER)
-        self.assertEqual(result.state, d.DiscoveryState.AIO_UNBOUND)
-        self.assertIsNotNone(result.aio)
-        self.assertEqual(result.aio["mac"], DEVICE)
-        self.assertEqual(result.aio["master_mac"], self.ZERO)
-        self.assertIn("AIO visible but unbound", result.message())
-
-    def test_aio_foreign_when_bound_to_other_master(self):
-        foreign = record(master=OTHER_MASTER, device=DEVICE)
-        result = d.classify_discovery([self._frame(foreign)], MASTER)
-        self.assertEqual(result.state, d.DiscoveryState.AIO_FOREIGN)
-        self.assertEqual(result.aio["master_mac"], OTHER_MASTER)
-        self.assertIn("different master", result.message())
-
-    def test_aio_bound_is_the_only_healthy_state(self):
-        frame = self._frame(record(master=MASTER, device=DEVICE))
-        result = d.classify_discovery([frame], MASTER)
-        self.assertEqual(result.state, d.DiscoveryState.AIO_BOUND)
-        self.assertTrue(result.ok)
-        self.assertEqual(result.aio["mac"], DEVICE)
-        self.assertEqual(result.aio["seq_index"], 1)
-
-    def test_bound_aio_preferred_over_unbound_when_both_visible(self):
-        unbound = record(master=self.ZERO, device=bytes.fromhex("c0c1c2c3c4c5"))
-        bound = record(master=MASTER, device=DEVICE)
-        result = d.classify_discovery([self._frame(unbound, bound)], MASTER)
-        self.assertEqual(result.state, d.DiscoveryState.AIO_BOUND)
-        self.assertEqual(result.aio["mac"], DEVICE)
-
-    def test_aio_detail_includes_identity_fields(self):
-        rec = d.parse_record(record(master=self.ZERO))
-        detail = d.aio_detail(rec)
-        self.assertIn(DEVICE.hex(":"), detail)
-        self.assertIn("master=00:00:00:00:00:00", detail)
-        self.assertIn("rx_type=", detail)
-        self.assertIn("device_type=", detail)
-
-
-class BindPacketTests(unittest.TestCase):
-    def test_bind_packet_layout_matches_upstream_handshake(self):
-        rf = d.cmd_bind_aio(MASTER, 8, DEVICE, [40, 41, 42, 43], target_rx=1)
-        self.assertEqual(len(rf), d.RF_DATA_SIZE)
-        self.assertEqual(rf[0], d.RF_SELECT)
-        self.assertEqual(rf[1], d.RF_PWM_CMD)
-        self.assertEqual(rf[2:8], DEVICE)
-        # Target master copied to bytes 8..14.
-        self.assertEqual(rf[8:14], MASTER)
-        self.assertEqual(rf[15], 8)  # master channel
-        # Target rx copied to both byte 14 and byte 16.
-        self.assertEqual(rf[14], 1)
-        self.assertEqual(rf[16], 1)
-        # Current PWM echoed at bytes 17..21 so the bind does not disturb fans.
-        self.assertEqual(rf[17:21], bytes([40, 41, 42, 43]))
-
-    def test_bind_packet_rejects_wrong_pwm_length(self):
-        with self.assertRaises(ValueError):
-            d.cmd_bind_aio(MASTER, 8, DEVICE, [40, 41, 42], target_rx=1)
-
-    def test_save_config_is_broadcast(self):
-        rf = d.cmd_save_config(MASTER)
-        self.assertEqual(len(rf), d.RF_DATA_SIZE)
-        self.assertEqual(rf[0], d.RF_SELECT)
-        self.assertEqual(rf[1], d.RF_SAVE_CONFIG)
-        # Broadcast target ff:ff:ff:ff:ff:ff and rx 0xff.
-        self.assertEqual(rf[2:8], b"\xff" * 6)
-        self.assertEqual(rf[8:14], MASTER)
-        self.assertEqual(rf[14], 0xFF)
 
 
 class DoctorLogParsingTests(unittest.TestCase):
@@ -309,7 +198,7 @@ class DoctorLogParsingTests(unittest.TestCase):
     )
 
     def test_parse_last_telemetry_returns_state_and_timestamp(self):
-        ts, state = d.parse_last_telemetry("noise\n" + self.TELEMETRY + "\nmore noise")
+        ts, state = doc.parse_last_telemetry("noise\n" + self.TELEMETRY + "\nmore noise")
         self.assertEqual(state, "ok")
         self.assertEqual(ts.year, 2026)
         self.assertEqual(ts.minute, 59)
@@ -317,28 +206,28 @@ class DoctorLogParsingTests(unittest.TestCase):
     def test_parse_last_telemetry_picks_most_recent(self):
         old = self.TELEMETRY.replace("telemetry=ok", "telemetry=soft_stale")
         new = self.TELEMETRY  # later in the file
-        _, state = d.parse_last_telemetry(old + "\n" + new)
+        _, state = doc.parse_last_telemetry(old + "\n" + new)
         self.assertEqual(state, "ok")
 
     def test_parse_last_telemetry_handles_missing(self):
-        self.assertEqual(d.parse_last_telemetry("nothing here"), (None, None))
+        self.assertEqual(doc.parse_last_telemetry("nothing here"), (None, None))
 
     def test_parse_recent_discovery_state_detects_unbound(self):
         text = (
             "2026-06-18 07:00:00,000 INFO master: 01:02:03:04:05:06 ch=8\n"
-            "2026-06-18 07:00:05,000 WARNING AIO visible but unbound "
-            "(mac=2d:a3:74:e5:66:e1 master=00:00:00:00:00:00 ch=8 rx_type=254 device_type=11)"
+            "2026-06-18 07:00:05,000 WARNING hardware discovery/control failed: "
+            "HydroShift AIO not found bound to this master; retrying in 30.0s"
         )
-        self.assertEqual(d.parse_recent_discovery_state(text), d.DiscoveryState.AIO_UNBOUND)
+        self.assertEqual(doc.parse_recent_discovery_state(text), doc.HealthStatus.UNBOUND)
 
     def test_parse_recent_discovery_state_detects_bound_control_loop(self):
         self.assertEqual(
-            d.parse_recent_discovery_state("2026-06-18 07:00:10,000 INFO entering control loop"),
-            d.DiscoveryState.AIO_BOUND,
+            doc.parse_recent_discovery_state("2026-06-18 07:00:10,000 INFO entering control loop"),
+            "bound",
         )
 
     def test_parse_last_rgb_applied_returns_timestamp(self):
-        ts = d.parse_last_rgb_applied("2026-06-18 07:01:00,000 INFO applied OpenRGB RGB frame: 96 LEDs")
+        ts = doc.parse_last_rgb_applied("2026-06-18 07:01:00,000 INFO applied OpenRGB RGB frame: 96 LEDs")
         self.assertIsNotNone(ts)
         self.assertEqual(ts.hour, 7)
 
@@ -348,17 +237,17 @@ class DoctorLogParsingTests(unittest.TestCase):
             "2026-06-18 07:01:00,000 INFO applied OpenRGB RGB frame: 96 LEDs",
             "2026-06-18 07:02:00,000 INFO lianli-hydroshift daemon starting",
         ])
-        ts = d.parse_last_daemon_start(text)
+        ts = doc.parse_last_daemon_start(text)
         self.assertIsNotNone(ts)
         self.assertEqual(ts.minute, 2)
 
     def test_process_running_ignores_current_doctor_process(self):
         class Completed:
             returncode = 0
-            stdout = str(d.os.getpid()) + "\n"
+            stdout = str(doc.os.getpid()) + "\n"
 
-        with patch.object(d.subprocess, "run", return_value=Completed()):
-            self.assertFalse(d.process_running("lianli_hydroshift.daemon"))
+        with patch.object(doc.subprocess, "run", return_value=Completed()):
+            self.assertFalse(doc.process_running("lianli_hydroshift.daemon"))
 
 
 class DoctorClassificationTests(unittest.TestCase):
@@ -368,7 +257,7 @@ class DoctorClassificationTests(unittest.TestCase):
             rx_present=True,
             daemon_running=True,
             telemetry_age_s=2.0,
-            discovery_state=d.DiscoveryState.AIO_BOUND,
+            discovery_state="bound",
             openrgb_port_open=True,
             rgb_applied=True,
         )
@@ -376,130 +265,45 @@ class DoctorClassificationTests(unittest.TestCase):
         return base
 
     def test_healthy_when_everything_passes(self):
-        status, action = d.classify_health(**self._kwargs())
-        self.assertEqual(status, d.HealthStatus.HEALTHY)
+        status, action = doc.classify_health(**self._kwargs())
+        self.assertEqual(status, doc.HealthStatus.HEALTHY)
         self.assertIn("passed", action.lower())
 
     def test_disconnected_takes_precedence(self):
-        status, action = d.classify_health(**self._kwargs(rx_present=False, daemon_running=False))
-        self.assertEqual(status, d.HealthStatus.DISCONNECTED)
+        status, action = doc.classify_health(**self._kwargs(rx_present=False, daemon_running=False))
+        self.assertEqual(status, doc.HealthStatus.DISCONNECTED)
         self.assertIn("RX", action)
         self.assertIn("replug", action.lower())
 
     def test_unbound_detected_before_daemon_down(self):
-        status, action = d.classify_health(
-            **self._kwargs(discovery_state=d.DiscoveryState.AIO_UNBOUND, daemon_running=False)
+        status, action = doc.classify_health(
+            **self._kwargs(discovery_state=doc.HealthStatus.UNBOUND, daemon_running=False)
         )
-        self.assertEqual(status, d.HealthStatus.UNBOUND)
+        self.assertEqual(status, doc.HealthStatus.UNBOUND)
         self.assertIn("recover-display.sh", action)
 
     def test_daemon_down_when_hardware_present_but_no_process(self):
-        status, action = d.classify_health(**self._kwargs(daemon_running=False, discovery_state=None))
-        self.assertEqual(status, d.HealthStatus.DAEMON_DOWN)
+        status, action = doc.classify_health(**self._kwargs(daemon_running=False, discovery_state=None))
+        self.assertEqual(status, doc.HealthStatus.DAEMON_DOWN)
         self.assertIn("kickstart", action)
 
     def test_stale_when_telemetry_old(self):
-        status, _ = d.classify_health(**self._kwargs(telemetry_age_s=9999.0))
-        self.assertEqual(status, d.HealthStatus.STALE)
+        status, _ = doc.classify_health(**self._kwargs(telemetry_age_s=9999.0))
+        self.assertEqual(status, doc.HealthStatus.STALE)
 
     def test_stale_when_no_telemetry_seen(self):
-        status, _ = d.classify_health(**self._kwargs(telemetry_age_s=None))
-        self.assertEqual(status, d.HealthStatus.STALE)
+        status, _ = doc.classify_health(**self._kwargs(telemetry_age_s=None))
+        self.assertEqual(status, doc.HealthStatus.STALE)
 
     def test_rgb_not_applied_when_cooling_healthy_but_no_frame(self):
-        status, action = d.classify_health(**self._kwargs(rgb_applied=False))
-        self.assertEqual(status, d.HealthStatus.RGB_NOT_APPLIED)
+        status, action = doc.classify_health(**self._kwargs(rgb_applied=False))
+        self.assertEqual(status, doc.HealthStatus.RGB_NOT_APPLIED)
         self.assertIn("RGB", action)
 
     def test_rgb_not_applied_when_bridge_closed(self):
-        status, _ = d.classify_health(**self._kwargs(openrgb_port_open=False))
-        self.assertEqual(status, d.HealthStatus.RGB_NOT_APPLIED)
+        status, _ = doc.classify_health(**self._kwargs(openrgb_port_open=False))
+        self.assertEqual(status, doc.HealthStatus.RGB_NOT_APPLIED)
 
-
-class AutoRebindTests(unittest.TestCase):
-    ZERO = bytes(6)
-
-    def _frame(self, *records):
-        return bytes([d.USB_CMD_SEND_RF, len(records), 0, 0]) + b"".join(records)
-
-    def _unbound_result(self):
-        frame = self._frame(record(master=self.ZERO, device=DEVICE))
-        return d.classify_discovery([frame], MASTER)
-
-    def _cfg(self, **overrides):
-        base = {"auto_rebind_visible_aio": True, "auto_rebind_allow_list": []}
-        base.update(overrides)
-        return base
-
-    def test_disabled_by_default_config(self):
-        cfg = d.load_config(None)
-        self.assertFalse(cfg["auto_rebind_visible_aio"])
-        eligible, reason = d.should_auto_rebind(self._unbound_result(), cfg)
-        self.assertFalse(eligible)
-        self.assertIn("disabled", reason)
-
-    def test_eligible_for_single_unbound_aio_when_enabled(self):
-        eligible, reason = d.should_auto_rebind(self._unbound_result(), self._cfg())
-        self.assertTrue(eligible)
-        self.assertIn(DEVICE.hex(":"), reason)
-
-    def test_eligible_with_duplicate_records_for_same_unbound_aio(self):
-        # collect_rx_frames samples multiple frames; the same visible AIO can
-        # appear once per frame. That is still one physical AIO and should be
-        # auto-rebindable.
-        frame = self._frame(record(master=self.ZERO, device=DEVICE))
-        result = d.classify_discovery([frame, frame, frame], MASTER)
-        eligible, reason = d.should_auto_rebind(result, self._cfg())
-        self.assertTrue(eligible)
-        self.assertIn(DEVICE.hex(":"), reason)
-
-    def test_not_eligible_for_bound_state(self):
-        frame = self._frame(record(master=MASTER, device=DEVICE))
-        bound = d.classify_discovery([frame], MASTER)
-        eligible, reason = d.should_auto_rebind(bound, self._cfg())
-        self.assertFalse(eligible)
-        self.assertIn("not auto-rebindable", reason)
-
-    def test_not_eligible_when_multiple_aios_visible(self):
-        frame = self._frame(
-            record(master=self.ZERO, device=DEVICE),
-            record(master=self.ZERO, device=bytes.fromhex("c0c1c2c3c4c5")),
-        )
-        result = d.classify_discovery([frame], MASTER)
-        eligible, reason = d.should_auto_rebind(result, self._cfg())
-        self.assertFalse(eligible)
-        self.assertIn("exactly one", reason)
-
-    def test_allow_list_blocks_unlisted_mac(self):
-        cfg = self._cfg(auto_rebind_allow_list=["99:99:99:99:99:99"])
-        eligible, reason = d.should_auto_rebind(self._unbound_result(), cfg)
-        self.assertFalse(eligible)
-        self.assertIn("allow_list", reason)
-
-    def test_allow_list_permits_listed_mac(self):
-        cfg = self._cfg(auto_rebind_allow_list=[DEVICE.hex(":")])
-        eligible, _ = d.should_auto_rebind(self._unbound_result(), cfg)
-        self.assertTrue(eligible)
-
-    def test_not_eligible_when_target_rx_occupied_by_non_aio_device(self):
-        occupied = record(
-            master=MASTER,
-            device=bytes.fromhex("b0b1b2b3b4b5"),
-            device_type=5,
-            rx_type=d.AUTO_REBIND_TARGET_RX,
-        )
-        unbound = record(master=self.ZERO, device=DEVICE, rx_type=0xFE)
-        result = d.classify_discovery([self._frame(occupied, unbound)], MASTER)
-        eligible, reason = d.should_auto_rebind(result, self._cfg())
-        self.assertFalse(eligible)
-        self.assertIn("target rx", reason)
-
-    def test_normalize_mac_list_lowercases_and_handles_dashes(self):
-        self.assertEqual(
-            d.normalize_mac_list(["2D-A3-74-E5-66-E1", " AA:BB:CC:DD:EE:FF "]),
-            ["2d:a3:74:e5:66:e1", "aa:bb:cc:dd:ee:ff"],
-        )
-        self.assertEqual(d.normalize_mac_list("not-a-list"), [])
 
 
 class OpenRgbBridgeTests(unittest.TestCase):

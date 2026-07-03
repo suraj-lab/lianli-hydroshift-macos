@@ -12,19 +12,14 @@ import argparse
 import copy
 import ctypes
 import ctypes.util
-import enum
 import json
 import logging
 import os
 import signal
-import socket
-import subprocess
 import sys
 import time
-from datetime import datetime
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Sequence
 
 from .openrgb import OpenRgbBridge, OpenRgbDevice, OpenRgbZone
 
@@ -43,9 +38,6 @@ LOG = logging.getLogger("lianli-hydroshift")
 
 TX_IDS = [(0x0416, 0x8040), (0x1A86, 0xE304)]
 RX_IDS = [(0x0416, 0x8041), (0x1A86, 0xE305)]
-# Direct LCD controller (not the wireless path); only reachable when its
-# firmware is healthy. See the 2026-06-04 display recovery incident.
-LCD_IDS = [(0x1CBE, 0xA034)]
 
 USB_CMD_SEND_RF = 0x10
 USB_CMD_GET_MAC = 0x11
@@ -57,10 +49,7 @@ RF_MASTER_CLOCK = 0x14
 RF_AIO_SWITCH_WIRELESS = 0x19
 RF_SET_RGB = 0x20
 RF_AIO_PARAMS = 0x21
-RF_SAVE_CONFIG = 0x15
 RF_DATA_SIZE = 240
-BROADCAST_MAC = b"\xff" * 6
-BROADCAST_RX = 0xFF
 RF_CHUNK_SIZE = 60
 RF_CHUNKS = 4
 AIO_PARAM_LEN = 32
@@ -68,12 +57,6 @@ AIO_PARAM_LEN = 32
 DEVICE_TYPE_WATERBLOCK = 10
 DEVICE_TYPE_WATERBLOCK2 = 11
 AIO_DEVICE_TYPES = {DEVICE_TYPE_WATERBLOCK, DEVICE_TYPE_WATERBLOCK2}
-
-# An AIO that has not been bound to a master advertises an all-zero master MAC
-# (the 2026-06-18 failure mode). parse_record already rejects records whose
-# rx_type byte is 0xFF, so an "invalid rx_type" here means the bind handshake
-# has not completed even though the device is otherwise visible.
-ZERO_MAC = b"\x00" * 6
 
 PUMP_MIN_RPM = 1600
 PUMP_MAX_RPM_WATERBLOCK = 2500
@@ -163,15 +146,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # failures instead of letting launchd restart it every ~30 seconds.
     "discovery_retry_interval_s": 30.0,
     "usb_error_reconnect_threshold": 3,
-    # Conservative, OFF by default. When enabled, the daemon may automatically
-    # re-bind a single visible-but-unbound AIO (the 2026-06-18 failure mode)
-    # instead of only logging the manual recovery command. Only triggers under
-    # the strict safety checks in should_auto_rebind(). When disabled, the daemon
-    # logs the exact recover-display.sh command to run.
-    "auto_rebind_visible_aio": False,
-    # Optional allow-list of AIO MACs (e.g. "2d:a3:74:e5:66:e1") permitted for
-    # auto-rebind. Empty means "any single unbound AIO" once auto-rebind is on.
-    "auto_rebind_allow_list": [],
 }
 
 running = True
@@ -180,56 +154,6 @@ reload_requested = False
 
 class DiscoveryError(RuntimeError):
     """Recoverable failure while finding the wireless AIO path."""
-
-
-class DiscoveryState(enum.Enum):
-    """Classified outcome of an AIO discovery attempt.
-
-    Distinguishing these states lets logs/status report the actual failure mode
-    instead of collapsing everything into "no bound AIO". Only ``AIO_BOUND`` is a
-    success; the rest are recoverable conditions with different next actions.
-    """
-
-    TX_MISSING = "tx_missing"
-    RX_MISSING = "rx_missing"
-    MASTER_UNKNOWN = "master_unknown"
-    NO_AIO_RECORDS = "no_aio_records"
-    AIO_UNBOUND = "aio_unbound"
-    AIO_FOREIGN = "aio_foreign"
-    AIO_BOUND = "aio_bound"
-
-
-@dataclass
-class DiscoveryResult:
-    """Structured result of classifying a discovery attempt."""
-
-    state: DiscoveryState
-    master_mac: bytes | None = None
-    aio: dict[str, Any] | None = None
-    aio_records: list[dict[str, Any]] = field(default_factory=list)
-    records: list[dict[str, Any]] = field(default_factory=list)
-    frame_count: int = 0
-
-    @property
-    def ok(self) -> bool:
-        return self.state is DiscoveryState.AIO_BOUND
-
-    def message(self) -> str:
-        """Operator-facing one-line description of the state."""
-        detail = aio_detail(self.aio) if self.aio is not None else None
-        if self.state is DiscoveryState.TX_MISSING:
-            return "TX wireless dongle not found"
-        if self.state is DiscoveryState.RX_MISSING:
-            return "RX wireless dongle not found"
-        if self.state is DiscoveryState.MASTER_UNKNOWN:
-            return "TX dongle did not respond to GET_MAC scan"
-        if self.state is DiscoveryState.NO_AIO_RECORDS:
-            return f"no HydroShift/WaterBlock AIO records visible (frames={self.frame_count})"
-        if self.state is DiscoveryState.AIO_UNBOUND:
-            return f"AIO visible but unbound ({detail})"
-        if self.state is DiscoveryState.AIO_FOREIGN:
-            return f"AIO visible but bound to a different master ({detail})"
-        return f"AIO bound to this master ({detail})"
 
 
 class ReconnectRequested(RuntimeError):
@@ -300,16 +224,6 @@ def normalize_curve(
         points.append((temp, val))
     points.sort(key=lambda p: p[0])
     return points
-
-
-def deep_merge(default: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    merged = copy.deepcopy(default)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = deep_merge(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
 
 
 # ---------- USB helpers ----------
@@ -474,25 +388,6 @@ def parse_frame_records(frame: bytes) -> list[dict[str, Any]]:
     return records
 
 
-def aio_detail(rec: dict[str, Any]) -> str:
-    """Compact AIO identity string for warning logs and status output."""
-    return (
-        f"mac={rec['mac'].hex(':')} master={rec['master_mac'].hex(':')} "
-        f"ch={rec['channel']} rx_type={rec['rx_type']} device_type={rec['device_type']}"
-    )
-
-
-def _prefer_aio(records: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Pick the preferred AIO record (WaterBlock2 first, then WaterBlock)."""
-    for rec in records:
-        if rec["device_type"] == DEVICE_TYPE_WATERBLOCK2:
-            return rec
-    for rec in records:
-        if rec["device_type"] == DEVICE_TYPE_WATERBLOCK:
-            return rec
-    return None
-
-
 def find_aio(frames: list[bytes], master_mac: bytes | None = None) -> dict[str, Any] | None:
     all_records: list[dict[str, Any]] = []
     for frame in frames:
@@ -508,173 +403,46 @@ def find_aio(frames: list[bytes], master_mac: bytes | None = None) -> dict[str, 
     for idx, rec in enumerate(bound_records):
         rec["seq_index"] = idx + 1
 
-    return _prefer_aio(bound_records)
+    return _pick_aio(bound_records)
 
 
-def classify_discovery(
-    frames: list[bytes],
-    master_mac: bytes | None,
-    *,
-    tx_present: bool = True,
-    rx_present: bool = True,
-) -> DiscoveryResult:
-    """Classify a discovery attempt into a structured :class:`DiscoveryResult`.
-
-    Precedence reflects what the operator must fix first: missing hardware, then
-    an unknown master, then the AIO bind state. Only ``AIO_BOUND`` is healthy.
-    """
-    if not tx_present:
-        return DiscoveryResult(DiscoveryState.TX_MISSING, frame_count=len(frames))
-    if not rx_present:
-        return DiscoveryResult(DiscoveryState.RX_MISSING, frame_count=len(frames))
-    if master_mac is None:
-        return DiscoveryResult(DiscoveryState.MASTER_UNKNOWN, frame_count=len(frames))
-
-    records: list[dict[str, Any]] = []
-    for frame in frames:
-        records.extend(parse_frame_records(frame))
-    aio_records = [r for r in records if r["device_type"] in AIO_DEVICE_TYPES]
-
-    if not aio_records:
-        return DiscoveryResult(
-            DiscoveryState.NO_AIO_RECORDS,
-            master_mac=master_mac,
-            records=records,
-            frame_count=len(frames),
-        )
-
-    bound = [r for r in aio_records if r["master_mac"] == master_mac]
-    if bound:
-        for idx, rec in enumerate(bound):
-            rec["seq_index"] = idx + 1
-        return DiscoveryResult(
-            DiscoveryState.AIO_BOUND,
-            master_mac=master_mac,
-            aio=_prefer_aio(bound),
-            aio_records=aio_records,
-            records=records,
-            frame_count=len(frames),
-        )
-
-    unbound = [r for r in aio_records if r["master_mac"] == ZERO_MAC]
-    if unbound:
-        return DiscoveryResult(
-            DiscoveryState.AIO_UNBOUND,
-            master_mac=master_mac,
-            aio=_prefer_aio(unbound),
-            aio_records=aio_records,
-            records=records,
-            frame_count=len(frames),
-        )
-
-    # Visible AIO records that belong to some other, non-zero master.
-    return DiscoveryResult(
-        DiscoveryState.AIO_FOREIGN,
-        master_mac=master_mac,
-        aio=_prefer_aio(aio_records),
-        aio_records=aio_records,
-        records=records,
-        frame_count=len(frames),
-    )
-
-
-# Slot the daemon binds an auto-recovered AIO into. Matches recover-display.py.
-AUTO_REBIND_TARGET_RX = 1
-
-
-def should_auto_rebind(
-    result: DiscoveryResult,
-    cfg: dict[str, Any],
-    target_rx: int = AUTO_REBIND_TARGET_RX,
-) -> tuple[bool, str]:
-    """Decide whether the daemon may automatically re-bind a visible AIO.
-
-    Conservative by design: returns ``(True, reason)`` only when auto-rebind is
-    enabled AND every safety condition holds, so the default daemon never mutates
-    device binding on its own. The reason is logged either way.
-    """
-    if not cfg.get("auto_rebind_visible_aio"):
-        return False, "auto_rebind_visible_aio is disabled"
-    if result.state is not DiscoveryState.AIO_UNBOUND:
-        return False, f"state {result.state.value} is not auto-rebindable"
-    aio_macs = {r["mac"] for r in result.aio_records}
-    if len(aio_macs) != 1:
-        return False, f"expected exactly one visible AIO, found {len(aio_macs)}"
-    aio = result.aio
-    if aio is None or aio["master_mac"] != ZERO_MAC:
-        return False, "AIO is not unbound (master is not all-zero)"
-    if any(
-        r["master_mac"] == result.master_mac and r["rx_type"] == target_rx
-        for r in result.records
-    ):
-        return False, f"target rx {target_rx} already occupied under this master"
-    allow_list = cfg.get("auto_rebind_allow_list") or []
-    if allow_list and aio["mac"].hex(":") not in allow_list:
-        return False, f"AIO {aio['mac'].hex(':')} not in auto_rebind_allow_list"
-    return True, f"single unbound AIO {aio['mac'].hex(':')} eligible for auto-rebind"
-
-
-def discovery_summary(frames: list[bytes], master_mac: bytes | None) -> str:
-    records: list[dict[str, Any]] = []
-    for frame in frames:
-        records.extend(parse_frame_records(frame))
-    bound_count = sum(1 for rec in records if master_mac is None or rec["master_mac"] == master_mac)
-    device_types = sorted({rec["device_type"] for rec in records})
-    return f"frames={len(frames)} records={len(records)} bound={bound_count} device_types={device_types}"
+def _pick_aio(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Pick the preferred AIO record (WaterBlock2 first, then WaterBlock)."""
+    for rec in records:
+        if rec["device_type"] == DEVICE_TYPE_WATERBLOCK2:
+            return rec
+    for rec in records:
+        if rec["device_type"] == DEVICE_TYPE_WATERBLOCK:
+            return rec
+    return None
 
 
 def connect_hydroshift(cfg: dict[str, Any] | None = None) -> tuple[Any, Any, dict[str, Any]]:
-    """Open USB dongles and locate the bound HydroShift AIO.
-
-    All failures here are recoverable for a daemon: the dongle may still be
-    enumerating, the AIO may not have advertised yet, or macOS/libusb may have
-    stale handles after sleep/replug. Release partial handles before raising so
-    the next retry starts from a clean libusb state.
-    """
+    """Open USB dongles and locate the bound HydroShift AIO."""
     tx = rx = None
     try:
         tx = find_dongle(TX_IDS)
         rx = find_dongle(RX_IDS)
         if tx is None or rx is None:
-            result = classify_discovery([], None, tx_present=bool(tx), rx_present=bool(rx))
-            raise DiscoveryError(result.message())
+            missing = " and ".join(n for n, ok in (("TX", tx is not None), ("RX", rx is not None)) if not ok)
+            raise DiscoveryError(f"{missing} wireless dongle not found")
         claim(tx)
         claim(rx)
 
         master_mac, master_ch = discover_master(tx)
         if master_mac is None or master_ch is None:
-            raise DiscoveryError(classify_discovery([], None).message())
+            raise DiscoveryError("TX dongle did not respond to GET_MAC scan")
         LOG.info("master: %s ch=%s", master_mac.hex(":"), master_ch)
 
         frames = collect_rx_frames(rx, count=5, max_wait=5.0)
-        result = classify_discovery(frames, master_mac)
-
-        # Optional, config-gated self-healing for the 2026-06-18 visible-but-
-        # unbound failure mode. Default config never reaches the rebind path.
-        if result.state is DiscoveryState.AIO_UNBOUND and cfg is not None:
-            eligible, reason = should_auto_rebind(result, cfg)
-            if eligible:
-                LOG.warning("auto-rebind eligible: %s", reason)
-                result = perform_auto_rebind(tx, rx, master_mac, master_ch, result.aio)
-            else:
-                LOG.warning("auto-rebind skipped: %s", reason)
-
-        if not result.ok:
-            # An unbound/foreign AIO is visible but unusable; surface its identity
-            # so logs distinguish it from "nothing on the air" and so the recovery
-            # tooling has the MAC/master/rx_type it needs.
-            if result.aio is not None:
-                LOG.warning("%s [%s]", result.message(), discovery_summary(frames, master_mac))
-            if result.state is DiscoveryState.AIO_UNBOUND:
-                LOG.warning("to recover, run: ./scripts/recover-display.sh (use --dry-run first)")
-            raise DiscoveryError(
-                f"{result.message()} ({discovery_summary(frames, master_mac)})"
-            )
+        aio = find_aio(frames, master_mac)
+        if aio is None:
+            raise DiscoveryError("HydroShift AIO not found bound to this master")
 
         return tx, rx, {
             "master_mac": master_mac,
             "master_ch": master_ch,
-            "record": result.aio,
+            "record": aio,
         }
     except Exception:
         release(tx, "TX")
@@ -748,91 +516,12 @@ def cmd_aio_params(master_mac: bytes, master_ch: int, device_mac: bytes, rx_type
     return bytes(rf)
 
 
-def cmd_bind_aio(
-    master_mac: bytes,
-    master_ch: int,
-    device_mac: bytes,
-    current_pwm: list[int],
-    target_rx: int,
-) -> bytes:
-    """Build the RF frame that binds a visible AIO to this master.
-
-    Mirrors the upstream bind handshake used to recover the 2026-06-18
-    visible-but-unbound failure: the target master goes in bytes 8..14, the
-    target rx slot is written to both byte 14 and byte 16, and the AIO's current
-    PWM is echoed back at bytes 17..21 so the bind does not disturb fan speed.
-    """
-    if len(current_pwm) != 4:
-        raise ValueError("current_pwm must contain four slots")
-    rf = bytearray(RF_DATA_SIZE)
-    rf[0] = RF_SELECT
-    rf[1] = RF_PWM_CMD
-    rf[2:8] = device_mac
-    rf[8:14] = master_mac
-    rf[14] = clamp_int(target_rx, 0, 255, "target_rx")
-    rf[15] = master_ch
-    rf[16] = clamp_int(target_rx, 0, 255, "target_rx")
-    rf[17:21] = bytes(clamp_int(v, 0, 255, "pwm") for v in current_pwm)
-    return bytes(rf)
-
-
-def cmd_save_config(master_mac: bytes) -> bytes:
-    """Build the broadcast SaveConfig RF frame that persists the new binding.
-
-    Broadcast to ``ff:ff:ff:ff:ff:ff`` with rx ``0xff`` so the receiver commits
-    its RF config to flash regardless of which slot the AIO landed on.
-    """
-    rf = bytearray(RF_DATA_SIZE)
-    rf[0] = RF_SELECT
-    rf[1] = RF_SAVE_CONFIG
-    rf[2:8] = BROADCAST_MAC
-    rf[8:14] = master_mac
-    rf[14] = BROADCAST_RX
-    return bytes(rf)
-
-
 def send_master_clock(tx, master_mac: bytes, master_ch: int) -> None:
     rf = bytearray(RF_DATA_SIZE)
     rf[0] = RF_SELECT
     rf[1] = RF_MASTER_CLOCK
     rf[8:14] = master_mac
     send_rf_chunks(tx, bytes(rf), packet_channel=master_ch, packet_rx_type=0xFF)
-
-
-def perform_auto_rebind(
-    tx,
-    rx,
-    master_mac: bytes,
-    master_ch: int,
-    aio: dict[str, Any],
-    target_rx: int = AUTO_REBIND_TARGET_RX,
-) -> DiscoveryResult:
-    """Bind a visible unbound AIO to this master, then persist and re-discover.
-
-    Mirrors the manual recover-display flow but bounded: repeatedly send the bind
-    frame, re-classify, and on success broadcast SaveConfig. Returns the final
-    DiscoveryResult so the caller can proceed only if it is now bound.
-    """
-    LOG.warning(
-        "auto-rebinding visible unbound AIO %s -> master %s rx=%s",
-        aio["mac"].hex(":"), master_mac.hex(":"), target_rx,
-    )
-    bind_rf = cmd_bind_aio(master_mac, master_ch, aio["mac"], aio["current_pwm"], target_rx)
-    save_rf = cmd_save_config(master_mac)
-    deadline = time.time() + 8.0
-    while running and time.time() < deadline:
-        for _ in range(6):
-            send_rf_frame(tx, bind_rf, aio["channel"], aio["rx_type"])
-            time.sleep(0.03)
-        result = classify_discovery(collect_rx_frames(rx, count=5, max_wait=4.0), master_mac)
-        if result.ok:
-            for _ in range(3):
-                send_rf_frame(tx, save_rf, master_ch, BROADCAST_RX)
-                time.sleep(0.2)
-            LOG.info("auto-rebind converged; RF config saved")
-            return result
-    LOG.warning("auto-rebind did not converge before timeout")
-    return classify_discovery(collect_rx_frames(rx, count=5, max_wait=5.0), master_mac)
 
 
 # ---------- Wireless RGB / OpenRGB bridge helpers ----------
@@ -1111,9 +800,41 @@ def resolve_pump_rpm(coolant_c: float, cfg: dict[str, Any]) -> int:
 
 # ---------- Fan curve / config ----------
 
+# ---------- Fan curve / config ----------
 
-def interpolate_pwm(coolant_c: float, curve: list[tuple[float, int]]) -> int:
-    return interpolate_value(float(coolant_c), curve)
+# ponyail: declarative config schema, add when >25 keys
+_INT_KEYS: list[tuple[str, int, int, int]] = [
+    ("min_pwm", 26, 0, 255),
+    ("pwm_hysteresis", 4, 0, 50),
+    ("rpm_hysteresis", 75, 0, 500),
+    ("pwm_ramp_up_per_tick", 4, 1, 255),
+    ("pwm_ramp_down_per_tick", 3, 1, 255),
+    ("rpm_ramp_up_per_tick", 75, 1, 2000),
+    ("rpm_ramp_down_per_tick", 50, 1, 2000),
+    ("stale_pwm", 60, 0, 255),
+    ("stale_pump_rpm", 1950, PUMP_MIN_RPM, PUMP_MAX_RPM_WATERBLOCK2),
+    ("failsafe_pwm", 160, 0, 255),
+    ("failsafe_pump_rpm", 2800, PUMP_MIN_RPM, PUMP_MAX_RPM_WATERBLOCK2),
+    ("theme_index_max", 12, 0, 12),
+    ("theme_index", 0, 0, None),  # clamped to theme_index_max after
+    ("brightness", 80, 0, 100),
+    ("rotation", 0, 0, 3),
+    ("openrgb_port", 6743, 1024, 65535),
+    ("usb_error_reconnect_threshold", 3, 1, 25),
+]
+_FLOAT_KEYS: list[tuple[str, float, float, float]] = [
+    ("coolant_min_valid_c", 15.0, -20.0, 80.0),
+    ("coolant_smoothing_alpha", 0.45, 0.05, 1.0),
+    ("coolant_max_drop_per_tick_c", 0.75, 0.1, 10.0),
+    ("coolant_max_rise_per_tick_c", 2.0, 0.1, 10.0),
+    ("coolant_reject_drop_c", 4.0, 1.0, 20.0),
+    ("coolant_reject_drop_extra_c_per_s", 0.04, 0.0, 0.5),
+    ("keepalive_interval_s", 1.0, 0.2, 10.0),
+    ("log_interval_s", 10.0, 1.0, 3600.0),
+    ("telemetry_soft_stale_s", None, 1.0, 300.0),  # default = telemetry_max_stale_s (below)
+    ("telemetry_hard_stale_s", 600.0, None, 900.0),  # low bound = telemetry_soft_stale_s (below)
+    ("discovery_retry_interval_s", 30.0, 2.0, 300.0),
+]
 
 
 def apply_min_pwm(pwm: int, min_pwm: int) -> int:
@@ -1131,7 +852,12 @@ def load_config(path: str | os.PathLike[str] | None) -> dict[str, Any]:
             user = json.load(f)
         if not isinstance(user, dict):
             raise ValueError("config root must be a JSON object")
-        cfg = deep_merge(cfg, user)
+        # ponytail: shallow merge; add deep_merge when config nests deeper than pump
+        for key, value in user.items():
+            if isinstance(value, dict) and isinstance(cfg.get(key), dict):
+                cfg[key] = {**cfg[key], **value}
+            else:
+                cfg[key] = value
 
     cfg["fan_curve"] = normalize_curve(cfg["fan_curve"], name="fan_curve", y_low=0, y_high=255)
     pump_cfg = cfg.get("pump")
@@ -1146,52 +872,31 @@ def load_config(path: str | os.PathLike[str] | None) -> dict[str, Any]:
         y_high=PUMP_MAX_RPM_WATERBLOCK2,
     )
 
-    cfg["min_pwm"] = clamp_int(cfg.get("min_pwm", 26), 0, 255, "min_pwm")
-    cfg["pwm_hysteresis"] = clamp_int(cfg.get("pwm_hysteresis", 4), 0, 50, "pwm_hysteresis")
-    cfg["rpm_hysteresis"] = clamp_int(cfg.get("rpm_hysteresis", 75), 0, 500, "rpm_hysteresis")
-    cfg["pwm_ramp_up_per_tick"] = clamp_int(cfg.get("pwm_ramp_up_per_tick", 4), 1, 255, "pwm_ramp_up_per_tick")
-    cfg["pwm_ramp_down_per_tick"] = clamp_int(cfg.get("pwm_ramp_down_per_tick", 3), 1, 255, "pwm_ramp_down_per_tick")
-    cfg["rpm_ramp_up_per_tick"] = clamp_int(cfg.get("rpm_ramp_up_per_tick", 75), 1, 2000, "rpm_ramp_up_per_tick")
-    cfg["rpm_ramp_down_per_tick"] = clamp_int(cfg.get("rpm_ramp_down_per_tick", 50), 1, 2000, "rpm_ramp_down_per_tick")
-    cfg["coolant_min_valid_c"] = clamp_float(cfg.get("coolant_min_valid_c", 15.0), -20.0, 80.0, "coolant_min_valid_c")
-    cfg["coolant_max_valid_c"] = clamp_float(cfg.get("coolant_max_valid_c", 70.0), cfg["coolant_min_valid_c"], 100.0, "coolant_max_valid_c")
-    cfg["coolant_smoothing_alpha"] = clamp_float(cfg.get("coolant_smoothing_alpha", 0.45), 0.05, 1.0, "coolant_smoothing_alpha")
-    cfg["coolant_max_drop_per_tick_c"] = clamp_float(cfg.get("coolant_max_drop_per_tick_c", 0.75), 0.1, 10.0, "coolant_max_drop_per_tick_c")
-    cfg["coolant_max_rise_per_tick_c"] = clamp_float(cfg.get("coolant_max_rise_per_tick_c", 2.0), 0.1, 10.0, "coolant_max_rise_per_tick_c")
-    cfg["coolant_reject_drop_c"] = clamp_float(cfg.get("coolant_reject_drop_c", 4.0), 1.0, 20.0, "coolant_reject_drop_c")
-    cfg["coolant_reject_drop_extra_c_per_s"] = clamp_float(cfg.get("coolant_reject_drop_extra_c_per_s", 0.04), 0.0, 0.5, "coolant_reject_drop_extra_c_per_s")
-    cfg["keepalive_interval_s"] = clamp_float(cfg.get("keepalive_interval_s", 1.0), 0.2, 10.0, "keepalive_interval_s")
-    cfg["log_interval_s"] = clamp_float(cfg.get("log_interval_s", 10.0), 1.0, 3600.0, "log_interval_s")
-    cfg["telemetry_soft_stale_s"] = clamp_float(cfg.get("telemetry_soft_stale_s", cfg.get("telemetry_max_stale_s", 30.0)), 1.0, 300.0, "telemetry_soft_stale_s")
-    cfg["telemetry_hard_stale_s"] = clamp_float(cfg.get("telemetry_hard_stale_s", 600.0), cfg["telemetry_soft_stale_s"], 900.0, "telemetry_hard_stale_s")
+    # ponytail: data-driven config validation; add per-key overrides when needed
+    for key, default, low, high in _INT_KEYS:
+        if key == "theme_index":
+            cfg[key] = clamp_int(cfg.get(key, default), 0, cfg["theme_index_max"], key)
+        else:
+            cfg[key] = clamp_int(cfg.get(key, default), low, high if high is not None else 999999, key)
+    for key, default, low, high in _FLOAT_KEYS:
+        if key == "telemetry_soft_stale_s":
+            default = cfg.get("telemetry_max_stale_s", 30.0)
+            cfg[key] = clamp_float(cfg.get(key, default), low, high, key)
+        elif key == "telemetry_hard_stale_s":
+            low_bound = cfg["telemetry_soft_stale_s"]
+            cfg[key] = clamp_float(cfg.get(key, default), low_bound, high, key)
+        else:
+            cfg[key] = clamp_float(cfg.get(key, default), low, high, key)
     cfg["telemetry_max_stale_s"] = cfg["telemetry_hard_stale_s"]
-    cfg["stale_pwm"] = apply_min_pwm(cfg.get("stale_pwm", 60), cfg["min_pwm"])
-    cfg["stale_pump_rpm"] = clamp_int(cfg.get("stale_pump_rpm", 1950), PUMP_MIN_RPM, PUMP_MAX_RPM_WATERBLOCK2, "stale_pump_rpm")
-    cfg["failsafe_pwm"] = apply_min_pwm(cfg.get("failsafe_pwm", 160), cfg["min_pwm"])
-    cfg["failsafe_pump_rpm"] = clamp_int(cfg.get("failsafe_pump_rpm", 2800), PUMP_MIN_RPM, PUMP_MAX_RPM_WATERBLOCK2, "failsafe_pump_rpm")
-    cfg["theme_index_max"] = clamp_int(cfg.get("theme_index_max", 12), 0, 12, "theme_index_max")
-    cfg["theme_index"] = clamp_int(cfg.get("theme_index", 0), 0, cfg["theme_index_max"], "theme_index")
-    cfg["brightness"] = clamp_int(cfg.get("brightness", 80), 0, 100, "brightness")
-    cfg["rotation"] = clamp_int(cfg.get("rotation", 0), 0, 3, "rotation")
+    # Special post-clamp fixes
+    cfg["coolant_max_valid_c"] = clamp_float(cfg.get("coolant_max_valid_c", 70.0), cfg["coolant_min_valid_c"], 100.0, "coolant_max_valid_c")
+    cfg["stale_pwm"] = apply_min_pwm(cfg["stale_pwm"], cfg["min_pwm"])
+    cfg["failsafe_pwm"] = apply_min_pwm(cfg["failsafe_pwm"], cfg["min_pwm"])
+    # Simple key handlers
     cfg["send_master_clock"] = bool(cfg.get("send_master_clock", False))
     cfg["openrgb_server"] = bool(cfg.get("openrgb_server", False))
     cfg["openrgb_host"] = str(cfg.get("openrgb_host", "127.0.0.1") or "127.0.0.1")
-    cfg["openrgb_port"] = clamp_int(cfg.get("openrgb_port", 6743), 1024, 65535, "openrgb_port")
     cfg["tinyuz_library"] = str(cfg.get("tinyuz_library", "") or "")
-    cfg["discovery_retry_interval_s"] = clamp_float(
-        cfg.get("discovery_retry_interval_s", 30.0),
-        2.0,
-        300.0,
-        "discovery_retry_interval_s",
-    )
-    cfg["usb_error_reconnect_threshold"] = clamp_int(
-        cfg.get("usb_error_reconnect_threshold", 3),
-        1,
-        25,
-        "usb_error_reconnect_threshold",
-    )
-    cfg["auto_rebind_visible_aio"] = bool(cfg.get("auto_rebind_visible_aio", False))
-    cfg["auto_rebind_allow_list"] = normalize_mac_list(cfg.get("auto_rebind_allow_list", []))
     return cfg
 
 
@@ -1230,18 +935,6 @@ def load_rgb_frame(config_path: str) -> list[Color] | None:
         return None
 
 
-def normalize_mac_list(value: Any) -> list[str]:
-    """Normalize an allow-list of MACs to lowercase colon-separated strings."""
-    if not isinstance(value, (list, tuple)):
-        return []
-    macs: list[str] = []
-    for item in value:
-        mac = str(item).strip().lower().replace("-", ":")
-        if mac:
-            macs.append(mac)
-    return macs
-
-
 def write_default_config(path: str | os.PathLike[str]) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -1267,16 +960,6 @@ def set_theme_in_config(path: str | os.PathLike[str], theme_index: int) -> int:
         json.dump(data, f, indent=2)
         f.write("\n")
     return clamped
-
-
-def curve_preview(cfg: dict[str, Any]) -> str:
-    temps = [28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50]
-    parts = []
-    for temp in temps:
-        pwm = apply_min_pwm(interpolate_pwm(temp, cfg["fan_curve"]), cfg["min_pwm"])
-        pump = resolve_pump_rpm(temp, cfg)
-        parts.append(f"{temp}C={pwm}/255 fan, {pump}rpm pump")
-    return "; ".join(parts)
 
 
 def coolant_rejection_reason(
@@ -1325,29 +1008,6 @@ def slew_limit(current: int, target: int, *, up_step: int, down_step: int) -> in
     if target < current:
         return max(target, current - down_step)
     return target
-
-
-def stale_targets(
-    last_coolant: float | None,
-    last_target_pwm: int | None,
-    last_pump_rpm: int | None,
-    cfg: dict[str, Any],
-) -> tuple[int, int]:
-    """Moderate stale-telemetry targets that avoid full-blast spikes.
-
-    Missing telemetry during heavy CPU load is common on this Hackintosh/PyUSB
-    path. Keep airflow/flow conservative but not alarming while waiting for RX
-    to recover. Hard failsafe remains separate for very long telemetry loss.
-    """
-    if last_coolant is not None:
-        curve_pwm = apply_min_pwm(interpolate_pwm(float(last_coolant), cfg["fan_curve"]), cfg["min_pwm"])
-        curve_pump = resolve_pump_rpm(float(last_coolant), cfg)
-    else:
-        curve_pwm = cfg["stale_pwm"]
-        curve_pump = cfg["stale_pump_rpm"]
-    pwm = max(last_target_pwm or 0, curve_pwm, cfg["stale_pwm"])
-    pump = max(last_pump_rpm or 0, curve_pump, cfg["stale_pump_rpm"])
-    return min(255, pwm), min(PUMP_MAX_RPM_WATERBLOCK2, pump)
 
 
 # ---------- Signals / daemon loop ----------
@@ -1434,7 +1094,7 @@ def run_theme_scan(
     LOG.info("theme scan: %s..%s, %.1fs per theme", start, end, dwell_s)
     step = 1 if end >= start else -1
     scan_theme_max = clamp_int(max(start, end, cfg["theme_index_max"]), 0, 255, "scan_theme_max")
-    target_pwm = apply_min_pwm(interpolate_pwm(35.0, cfg["fan_curve"]), cfg["min_pwm"])
+    target_pwm = apply_min_pwm(interpolate_value(35.0, cfg["fan_curve"]), cfg["min_pwm"])
     pump_rpm = resolve_pump_rpm(35.0, cfg)
     switch_rf = cmd_switch_wireless_theme(master_mac, master_ch, device_mac, rx_type)
     # Use a local rolling seq so the device doesn't ignore packets where seq
@@ -1472,285 +1132,6 @@ def run_theme_scan(
             time.sleep(1.0)
 
 
-# ---------- Doctor / health report ----------
-
-DEFAULT_LOG_DIR = os.path.expanduser("~/Library/Logs/lianli-hydroshift")
-LAUNCHD_LABEL = "com.suraj.lianli-hydroshift"
-
-# How long telemetry may go unseen in the log before we treat it as stale. This
-# is generous relative to the control-loop log cadence so a momentary gap does
-# not flap the verdict.
-DOCTOR_TELEMETRY_STALE_S = 120.0
-
-
-class HealthStatus(enum.Enum):
-    HEALTHY = "healthy"
-    DISCONNECTED = "disconnected"
-    DAEMON_DOWN = "daemon_down"
-    UNBOUND = "unbound"
-    STALE = "stale"
-    RGB_NOT_APPLIED = "rgb_not_applied"
-    UNKNOWN = "unknown"
-
-
-# Substrings of the explicit discovery log messages (see DiscoveryResult.message
-# and connect_hydroshift), mapped to the state they indicate. Order matters:
-# more specific phrases first.
-_DISCOVERY_LOG_MARKERS = [
-    ("AIO visible but unbound", DiscoveryState.AIO_UNBOUND),
-    ("AIO visible but bound to a different master", DiscoveryState.AIO_FOREIGN),
-    ("no HydroShift/WaterBlock AIO records visible", DiscoveryState.NO_AIO_RECORDS),
-    ("TX wireless dongle not found", DiscoveryState.TX_MISSING),
-    ("RX wireless dongle not found", DiscoveryState.RX_MISSING),
-    ("GET_MAC", DiscoveryState.MASTER_UNKNOWN),
-    ("entering control loop", DiscoveryState.AIO_BOUND),
-]
-
-
-def _parse_log_timestamp(line: str) -> datetime | None:
-    """Parse the leading ``asctime`` of a basicConfig-formatted log line."""
-    # Format: "YYYY-MM-DD HH:MM:SS,mmm LEVEL message"
-    parts = line.split(None, 2)
-    if len(parts) < 2:
-        return None
-    stamp = f"{parts[0]} {parts[1]}"
-    for fmt in ("%Y-%m-%d %H:%M:%S,%f", "%Y-%m-%d %H:%M:%S"):
-        try:
-            return datetime.strptime(stamp, fmt)
-        except ValueError:
-            continue
-    return None
-
-
-def parse_last_telemetry(text: str) -> tuple[datetime | None, str | None]:
-    """Return (timestamp, telemetry_state) of the most recent telemetry line."""
-    for line in reversed(text.splitlines()):
-        if "telemetry=" in line and "coolant=" in line:
-            state = None
-            for token in line.split():
-                if token.startswith("telemetry="):
-                    state = token.split("=", 1)[1]
-                    break
-            return _parse_log_timestamp(line), state
-    return None, None
-
-
-def parse_recent_discovery_state(text: str) -> DiscoveryState | None:
-    """Classify the most recent discovery-related log line, newest first."""
-    for line in reversed(text.splitlines()):
-        for marker, state in _DISCOVERY_LOG_MARKERS:
-            if marker in line:
-                return state
-    return None
-
-
-def parse_last_rgb_applied(text: str) -> datetime | None:
-    """Timestamp of the most recent successful OpenRGB frame apply, if any.
-
-    Matches both the first-apply and cached re-send log lines.
-    """
-    for line in reversed(text.splitlines()):
-        if "OpenRGB RGB frame" in line:
-            return _parse_log_timestamp(line)
-    return None
-
-
-def parse_last_daemon_start(text: str) -> datetime | None:
-    """Timestamp of the most recent daemon start line, if present."""
-    for line in reversed(text.splitlines()):
-        if "lianli-hydroshift daemon starting" in line:
-            return _parse_log_timestamp(line)
-    return None
-
-
-def read_daemon_log() -> str:
-    """Read the daemon log (stderr first, where logging writes, then stdout)."""
-    for name in (f"{LAUNCHD_LABEL}.err", f"{LAUNCHD_LABEL}.log"):
-        path = os.path.join(DEFAULT_LOG_DIR, name)
-        try:
-            with open(path, "r", errors="replace") as fh:
-                # Only the tail matters; avoid loading a huge rotated log.
-                return fh.read()[-200_000:]
-        except OSError:
-            continue
-    return ""
-
-
-def usb_presence() -> dict[str, bool]:
-    """Non-invasive presence check (enumeration only, no claim).
-
-    On macOS, pyusb may not see devices claimed by another process (the running
-    daemon). Fall back to system_profiler when pyusb returns False.
-    """
-    import subprocess
-
-    def present(ids: list[tuple[int, int]]) -> bool:
-        if usb_core is None:
-            return False
-        # Try pyusb first — fast path when devices are visible.
-        if any(usb_core.find(idVendor=v, idProduct=p) is not None for v, p in ids):
-            return True
-        # Fall back to system_profiler on macOS (catches devices held by a kernel
-        # driver or already claimed by another libusb process).
-        try:
-            output = subprocess.run(
-                ["system_profiler", "SPUSBDataType"],
-                capture_output=True, text=True, timeout=5.0,
-            ).stdout
-            for vid, pid in ids:
-                # system_profiler shows "Product ID: 0x{p:04x}" and "Vendor ID: 0x{v:04x}"
-                if f"Product ID: 0x{pid:04x}" in output and f"Vendor ID: 0x{vid:04x}" in output:
-                    return True
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        return False
-
-    return {
-        "tx": present(TX_IDS),
-        "rx": present(RX_IDS),
-        "lcd": present(LCD_IDS),
-    }
-
-
-def tcp_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
-def process_running(pattern: str) -> bool:
-    """Return whether another process matching pattern is running.
-
-    The doctor itself is launched as ``python -m lianli_hydroshift.daemon --doctor``,
-    so exclude our own PID to avoid reporting the daemon as running when only the
-    doctor process matches the module name.
-    """
-    try:
-        proc = subprocess.run(
-            ["pgrep", "-f", pattern], capture_output=True, text=True, timeout=5
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    if proc.returncode != 0:
-        return False
-    current_pid = os.getpid()
-    for line in proc.stdout.splitlines():
-        try:
-            if int(line.strip()) != current_pid:
-                return True
-        except ValueError:
-            continue
-    return False
-
-
-def classify_health(
-    *,
-    tx_present: bool,
-    rx_present: bool,
-    daemon_running: bool,
-    telemetry_age_s: float | None,
-    discovery_state: DiscoveryState | None,
-    openrgb_port_open: bool,
-    rgb_applied: bool,
-) -> tuple[HealthStatus, str]:
-    """Classify overall health and suggest the next safe action.
-
-    Precedence mirrors what must be fixed first: hardware, then the service, then
-    the AIO binding, then telemetry, then RGB. Returns ``(status, action)``.
-    """
-    if not tx_present or not rx_present:
-        missing = " and ".join(n for n, ok in (("TX", tx_present), ("RX", rx_present)) if not ok)
-        return (
-            HealthStatus.DISCONNECTED,
-            f"{missing} dongle missing — reseat/replug the USB dongle, then re-run.",
-        )
-    if discovery_state is DiscoveryState.AIO_UNBOUND:
-        return (
-            HealthStatus.UNBOUND,
-            "AIO visible but unbound — run ./scripts/recover-display.sh "
-            "(use --dry-run first to confirm the plan).",
-        )
-    if not daemon_running:
-        return (
-            HealthStatus.DAEMON_DOWN,
-            "Daemon not running — sudo launchctl kickstart -k "
-            f"system/{LAUNCHD_LABEL}",
-        )
-    if telemetry_age_s is None or telemetry_age_s > DOCTOR_TELEMETRY_STALE_S:
-        return (
-            HealthStatus.STALE,
-            "No fresh telemetry — check the daemon log; if persistent, "
-            f"sudo launchctl kickstart -k system/{LAUNCHD_LABEL}",
-        )
-    if not openrgb_port_open or not rgb_applied:
-        return (
-            HealthStatus.RGB_NOT_APPLIED,
-            "Cooling is healthy but RGB is not applied — start/reload OpenRGB "
-            "with ~/.config/OpenRGB/MacOS.orp (LaunchAgent org.openrgb).",
-        )
-    return (HealthStatus.HEALTHY, "All checks passed.")
-
-
-def run_doctor(config_path: str) -> int:
-    """Gather health signals, print a report, and return 0 if healthy else 1."""
-    presence = usb_presence()
-    log_text = read_daemon_log()
-    now = datetime.now()
-
-    ts, telemetry_state = parse_last_telemetry(log_text)
-    telemetry_age_s = (now - ts).total_seconds() if ts is not None else None
-    discovery_state = parse_recent_discovery_state(log_text)
-    rgb_ts = parse_last_rgb_applied(log_text)
-    daemon_start_ts = parse_last_daemon_start(log_text)
-    rgb_applied_this_run = rgb_ts is not None and (
-        daemon_start_ts is None or rgb_ts >= daemon_start_ts
-    )
-    daemon_running = process_running("lianli_hydroshift.daemon")
-
-    try:
-        cfg = load_config(config_path)
-        host, port = cfg["openrgb_host"], cfg["openrgb_port"]
-    except Exception:
-        host, port = "127.0.0.1", 6743
-    port_open = tcp_port_open(host, port)
-    openrgb_running = process_running("OpenRGB.app/Contents/MacOS/OpenRGB")
-
-    def yn(ok: bool) -> str:
-        return "ok" if ok else "MISSING"
-
-    print("== Lian Li HydroShift doctor ==")
-    print(f"  USB TX dongle : {yn(presence['tx'])}")
-    print(f"  USB RX dongle : {yn(presence['rx'])}")
-    print(f"  LCD direct USB: {'present' if presence['lcd'] else 'absent (normal when wireless theme is active)'}")
-    print(f"  Daemon process: {'running' if daemon_running else 'NOT running'}")
-    if telemetry_age_s is not None:
-        print(f"  Telemetry     : {telemetry_state} (last seen {telemetry_age_s:.0f}s ago)")
-    else:
-        print("  Telemetry     : none found in log")
-    if discovery_state is not None:
-        print(f"  Discovery     : {discovery_state.value}")
-    print(f"  OpenRGB bridge: {'reachable' if port_open else 'closed'} ({host}:{port})")
-    print(f"  OpenRGB app   : {'running' if openrgb_running else 'not running'}")
-    if rgb_ts is not None:
-        print(f"  Last RGB frame: {(now - rgb_ts).total_seconds():.0f}s ago")
-
-    status, action = classify_health(
-        tx_present=presence["tx"],
-        rx_present=presence["rx"],
-        daemon_running=daemon_running,
-        telemetry_age_s=telemetry_age_s,
-        discovery_state=discovery_state,
-        openrgb_port_open=port_open,
-        rgb_applied=rgb_applied_this_run,
-    )
-    print()
-    print(f"  STATUS: {status.value.upper()}")
-    print(f"  ACTION: {action}")
-    return 0 if status is HealthStatus.HEALTHY else 1
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Control a Lian Li HydroShift II wireless AIO")
     default_cfg = os.path.expanduser("~/.config/lianli-hydroshift/config.json")
@@ -1767,6 +1148,7 @@ def main(argv: list[str] | None = None) -> int:
     setup_signals()
 
     if args.doctor:
+        from .doctor import run_doctor
         return run_doctor(args.config)
 
     if args.write_default_config:
@@ -1792,7 +1174,7 @@ def main(argv: list[str] | None = None) -> int:
 
     LOG.info("lianli-hydroshift daemon starting")
     LOG.info("config: %s", args.config)
-    LOG.info("curve preview: %s", curve_preview(cfg))
+    LOG.info("curve: %s", f"fan={len(cfg['fan_curve'])}pts pump={cfg['pump']['mode']}")
     LOG.info("theme=%s brightness=%s rotation=%s", cfg["theme_index"], cfg["brightness"], cfg["rotation"])
 
     global reload_requested
@@ -1807,7 +1189,7 @@ def main(argv: list[str] | None = None) -> int:
             if reload_requested:
                 try:
                     cfg = load_config(args.config)
-                    LOG.info("config reloaded before discovery: %s", curve_preview(cfg))
+                    LOG.info("config reloaded before discovery: fan=%spts pump=%s", len(cfg['fan_curve']), cfg['pump']['mode'])
                 except Exception as exc:
                     LOG.warning("config reload failed, keeping previous config: %s", exc)
                 reload_requested = False
@@ -1886,7 +1268,7 @@ def main(argv: list[str] | None = None) -> int:
                 if reload_requested:
                     try:
                         cfg = load_config(args.config)
-                        LOG.info("config reloaded: %s", curve_preview(cfg))
+                        LOG.info("config reloaded: fan=%spts pump=%s", len(cfg['fan_curve']), cfg['pump']['mode'])
                         if openrgb_bridge is not None and not cfg["openrgb_server"]:
                             openrgb_bridge.stop()
                             openrgb_bridge = None
@@ -1951,9 +1333,17 @@ def main(argv: list[str] | None = None) -> int:
                     target_pwm = max(last_target_pwm or 0, cfg["failsafe_pwm"])
                     pump_rpm = max(last_pump_rpm or 0, cfg["failsafe_pump_rpm"])
                 elif telemetry_state == "soft_stale":
-                    target_pwm, pump_rpm = stale_targets(last_coolant, last_target_pwm, last_pump_rpm, cfg)
+                    # ponytail: inlined stale_targets; extract when soft-stale branches grow
+                    if last_coolant is not None:
+                        curve_pwm = apply_min_pwm(interpolate_value(float(last_coolant), cfg["fan_curve"]), cfg["min_pwm"])
+                        curve_pump = resolve_pump_rpm(float(last_coolant), cfg)
+                    else:
+                        curve_pwm = cfg["stale_pwm"]
+                        curve_pump = cfg["stale_pump_rpm"]
+                    target_pwm = min(255, max(last_target_pwm or 0, curve_pwm, cfg["stale_pwm"]))
+                    pump_rpm = min(PUMP_MAX_RPM_WATERBLOCK2, max(last_pump_rpm or 0, curve_pump, cfg["stale_pump_rpm"]))
                 else:
-                    desired_pwm = apply_min_pwm(interpolate_pwm(float(last_coolant), cfg["fan_curve"]), cfg["min_pwm"])
+                    desired_pwm = apply_min_pwm(interpolate_value(float(last_coolant), cfg["fan_curve"]), cfg["min_pwm"])
                     if last_target_pwm is not None and abs(desired_pwm - last_target_pwm) < cfg["pwm_hysteresis"]:
                         target_pwm = last_target_pwm
                     else:

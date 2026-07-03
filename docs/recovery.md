@@ -56,16 +56,16 @@ If it will not stay up, check the log:
 tail -n 100 ~/Library/Logs/lianli-hydroshift/com.suraj.lianli-hydroshift.err
 ```
 
-## STATUS: UNBOUND — AIO visible but unbound (the 2026-06-18 failure mode)
+## STATUS: UNBOUND — AIO not found bound (the 2026-06-18 failure mode)
 
-Symptom: the doctor shows `Discovery: aio_unbound`, and the daemon log contains:
+Symptom: the doctor shows `Discovery: unbound`, and the daemon log contains:
 
 ```text
-AIO visible but unbound (mac=2d:a3:74:e5:66:e1 master=00:00:00:00:00:00 ch=8 rx_type=254 device_type=11)
+hardware discovery/control failed: HydroShift AIO not found bound to this master; retrying in 30.0s
 ```
 
-The RX can see the HydroShift AIO record, but the AIO advertises an all-zero
-master, so the daemon's normal bound-device discovery skips it.
+The daemon does not distinguish an unbound AIO from one that is powered off or
+out of range — `recover-display.sh --dry-run` (step 1 below) makes that call.
 
 ### Bind recovery
 
@@ -94,19 +94,8 @@ master, so the daemon's normal bound-device discovery skips it.
    ./scripts/doctor.sh
    ```
 
-### Optional: daemon auto-rebind
-
-The daemon can self-heal this exact case if you opt in. In
-`~/.config/lianli-hydroshift/config.json`:
-
-```json
-"auto_rebind_visible_aio": true,
-"auto_rebind_allow_list": ["2d:a3:74:e5:66:e1"]
-```
-
-It only auto-rebinds when exactly one unbound AIO is visible (and, if the
-allow-list is non-empty, only that MAC). Default is off; when off, the daemon
-logs the manual `recover-display.sh` command instead.
+Daemon auto-rebind was removed on 2026-07-03; `recover-display.sh` is the only
+recovery path. Leftover `auto_rebind_*` keys in config.json are ignored.
 
 ## STATUS: STALE — no fresh telemetry
 

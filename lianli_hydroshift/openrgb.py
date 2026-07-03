@@ -304,16 +304,9 @@ class OpenRgbBridge:
         self.set_single_led(led_idx, (payload[4], payload[5], payload[6]))
 
     def _handle_update_mode(self, payload: bytes) -> None:
-        parsed = _parse_mode_data(payload, self.protocol_version)
-        if parsed is None:
-            return
-        mode_name, colors, brightness = parsed
-        if mode_name.lower() == "direct":
-            return
-        color = colors[0] if colors else (255, 255, 255)
-        scale = max(0.0, min(1.0, brightness / 100.0 if brightness > 4 else brightness / 4.0))
-        scaled = tuple(clamp_color(c * scale) for c in color)
-        self.set_all_colors([scaled] * self.device.total_leds)
+        # ponytail: only Direct mode is supported; full mode parsing adds ~100 lines
+        # for a feature OpenRGB rarely uses on cooler devices
+        return
 
     def _build_controller_data(self) -> bytes:
         buf = bytearray()
@@ -328,18 +321,6 @@ class OpenRgbBridge:
         _write_string(buf, f"wireless:{self.device.serial}")
 
         modes = [_mode_entry("Direct", 0, MODE_FLAG_HAS_PER_LED_COLOR, COLOR_MODE_PER_LED, self.protocol_version)]
-        modes.append(
-            _mode_entry(
-                "Static",
-                3,
-                MODE_FLAG_HAS_BRIGHTNESS | MODE_FLAG_HAS_MODE_SPECIFIC_COLOR,
-                COLOR_MODE_MODE_SPECIFIC,
-                self.protocol_version,
-                colors_min=1,
-                colors_max=1,
-                default_brightness=100,
-            )
-        )
         buf += struct.pack("<H", len(modes))
         buf += struct.pack("<i", 0)
         for mode in modes:
@@ -420,71 +401,3 @@ def _mode_entry(
     buf += struct.pack("<H", 0)  # colors
     return bytes(buf)
 
-
-def _read_string(data: bytes, cursor: int) -> tuple[str, int] | None:
-    if cursor + 2 > len(data):
-        return None
-    length = struct.unpack_from("<H", data, cursor)[0]
-    cursor += 2
-    if length == 0 or cursor + length > len(data):
-        return None
-    raw = data[cursor : cursor + length - 1]
-    cursor += length
-    return raw.decode("utf-8", "replace"), cursor
-
-
-def _read_u32(data: bytes, cursor: int) -> tuple[int, int] | None:
-    if cursor + 4 > len(data):
-        return None
-    return struct.unpack_from("<I", data, cursor)[0], cursor + 4
-
-
-def _read_u16(data: bytes, cursor: int) -> tuple[int, int] | None:
-    if cursor + 2 > len(data):
-        return None
-    return struct.unpack_from("<H", data, cursor)[0], cursor + 2
-
-
-def _parse_mode_data(payload: bytes, protocol_version: int) -> tuple[str, list[Color], int] | None:
-    if len(payload) < 8:
-        return None
-    cursor = 8  # data_size + mode_idx
-    parsed = _read_string(payload, cursor)
-    if parsed is None:
-        return None
-    name, cursor = parsed
-    # value, flags, speed_min, speed_max
-    for _ in range(4):
-        parsed_u32 = _read_u32(payload, cursor)
-        if parsed_u32 is None:
-            return None
-        _, cursor = parsed_u32
-    if protocol_version >= 3:
-        for _ in range(2):
-            parsed_u32 = _read_u32(payload, cursor)
-            if parsed_u32 is None:
-                return None
-            _, cursor = parsed_u32
-    # colors_min, colors_max, speed
-    for _ in range(3):
-        parsed_u32 = _read_u32(payload, cursor)
-        if parsed_u32 is None:
-            return None
-        _, cursor = parsed_u32
-    brightness = 4
-    if protocol_version >= 3:
-        parsed_u32 = _read_u32(payload, cursor)
-        if parsed_u32 is None:
-            return None
-        brightness, cursor = parsed_u32
-    # direction, color_mode
-    for _ in range(2):
-        parsed_u32 = _read_u32(payload, cursor)
-        if parsed_u32 is None:
-            return None
-        _, cursor = parsed_u32
-    parsed_u16 = _read_u16(payload, cursor)
-    if parsed_u16 is None:
-        return name, [], brightness
-    color_count, cursor = parsed_u16
-    return name, _parse_colors(payload[cursor:], color_count), brightness

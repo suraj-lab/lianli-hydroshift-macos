@@ -12,7 +12,7 @@ As of 2026-07-01:
 - It runs persistently at macOS boot via LaunchDaemon.
 - Fan and pump control are coolant-temperature based.
 - OpenRGB SDK bridge with full RGB profile support (tinyuz compression, cached frame re-send).
-- Guarded auto-rebind recovers from the unbound-AIO boot failure mode.
+- Unbound-AIO recovery is manual via `recover-display.sh` (daemon auto-rebind removed 2026-07-03).
 - `doctor.sh` provides one-command health classification.
 - Theme index 5 is selected; theme helper (`set-theme.sh`) is available.
 - Load-test tuning is accepted as good enough for daily use.
@@ -322,7 +322,13 @@ Acceptance criteria:
   one-off Python snippet.
 - The script prints before/after binding state clearly.
 
-### 8.3 Optional daemon self-healing ✅
+### 8.3 Optional daemon self-healing ✅ (removed 2026-07-03)
+
+> Removed in the 2026-07-03 simplification pass: auto-rebind, discovery
+> classification, and the in-daemon bind packet were deleted. The supported
+> recovery path is `scripts/recover-display.sh` (which has its own standalone
+> bind implementation in `scripts/recover-display.py`). The section below is
+> kept as a historical record.
 
 Goal: decide whether the daemon should automatically re-bind in the narrow safe
 case.
@@ -403,6 +409,11 @@ Acceptance criteria:
   (last RGB frame age), not just whether OpenRGB is connected. ✅
 - A daemon reconnect does not leave the cooler on mismatched RGB if a previous
   RGB frame is known — the cached frame is primed and re-sent. ✅
+
+Live validation:
+
+- 2026-07-03: cooler reconnected to the daemon at boot and applied the colour
+  profile automatically; no manual OpenRGB profile reapply was needed. ✅
 
 ### 8.5 Status / doctor command ✅
 
@@ -537,6 +548,22 @@ Next-step guardrails for the replacement unit:
   newer than `lianli-H2S-1.7`, re-verify the valid theme range conservatively
   using `--set-theme N` one index at a time — do **not** run the auto `--scan-themes`
   range, which is what walked into the bad index originally.
+
+## Simplification pass (2026-07-03)
+
+Deliberate code-shrink before the native-app pivot (~1,500 lines deleted, 57 → 42 tests):
+
+- Doctor extracted from `daemon.py` into `lianli_hydroshift/doctor.py`
+  (`--doctor` flag unchanged, delegates to the new module).
+- Auto-rebind, discovery classification, and the in-daemon bind packet removed
+  (see 8.3 note). Manual recovery via `recover-display.sh` is the supported path;
+  doctor's `UNBOUND` verdict now keys off the daemon's
+  `HydroShift AIO not found bound to this master` log line.
+- `auto_rebind_visible_aio` / `auto_rebind_allow_list` config keys removed;
+  leftover keys in existing configs are ignored.
+- Original prototype `lianli_daemon_v2.original.py` deleted (preserved in git history).
+- OpenRGB bridge trimmed to Direct mode only (Static mode + mode parsing removed).
+- `stale_targets` inlined into the control loop.
 
 ## Roadmap: native macOS app
 

@@ -174,18 +174,13 @@ Run the doctor first — it is read-only (no RF writes, does not take the dongle
 | `HEALTHY` | All checks pass | nothing to do |
 | `DISCONNECTED` | TX/RX dongle missing | reseat/replug the USB dongle |
 | `DAEMON_DOWN` | Hardware present, daemon not running | `sudo launchctl kickstart -k system/com.suraj.lianli-hydroshift` |
-| `UNBOUND` | AIO visible but unbound (2026-06-18 mode) | `./scripts/recover-display.sh --dry-run` then without `--dry-run` |
+| `UNBOUND` | AIO not found bound to this master (2026-06-18 mode, or AIO powered off) | `./scripts/recover-display.sh --dry-run` then without `--dry-run` |
 | `STALE` | No fresh telemetry | check the log; kickstart if it persists |
 | `RGB_NOT_APPLIED` | Cooling fine, RGB out of sync | `./scripts/reapply-openrgb-profile.sh` |
 
 Full step-by-step recovery, healthy/unbound examples, and when to stop and inspect hardware: [`docs/recovery.md`](docs/recovery.md).
 
-Opt-in daemon self-healing for the unbound case (default off):
-
-```json
-"auto_rebind_visible_aio": true,
-"auto_rebind_allow_list": ["2d:a3:74:e5:66:e1"]
-```
+Recovery from the unbound state is manual via `recover-display.sh` (daemon auto-rebind was removed 2026-07-03; unknown `auto_rebind_*` keys in an existing config are ignored).
 
 ## OpenRGB bridge
 
