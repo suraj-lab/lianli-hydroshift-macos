@@ -49,9 +49,13 @@ RF_MASTER_CLOCK = 0x14
 RF_AIO_SWITCH_WIRELESS = 0x19
 RF_SET_RGB = 0x20
 RF_AIO_PARAMS = 0x21
+RF_SAVE_CONFIG = 0x15
 RF_DATA_SIZE = 240
 RF_CHUNK_SIZE = 60
 RF_CHUNKS = 4
+
+BROADCAST_MAC = b"\xff" * 6
+BROADCAST_RX = 0xFF
 AIO_PARAM_LEN = 32
 
 DEVICE_TYPE_WATERBLOCK = 10
@@ -482,6 +486,45 @@ def cmd_switch_wireless_theme(master_mac: bytes, master_ch: int, device_mac: byt
     rf[8:14] = master_mac
     rf[14] = rx_type
     rf[15] = master_ch
+    return bytes(rf)
+
+
+def cmd_bind_aio(
+    master_mac: bytes,
+    master_ch: int,
+    device_mac: bytes,
+    current_pwm: list[int],
+    target_rx: int,
+) -> bytes:
+    """Build the RF frame that binds a visible AIO to this master.
+
+    Mirrors the upstream bind handshake used to recover a visible-but-unbound
+    AIO: the target master goes in bytes 8..14, the target rx slot is written
+    to both byte 14 and byte 16, and the AIO's current PWM is echoed back at
+    bytes 17..21 so the bind does not disturb fan speed.
+    """
+    if len(current_pwm) != 4:
+        raise ValueError("current_pwm must contain four slots")
+    rf = bytearray(RF_DATA_SIZE)
+    rf[0] = RF_SELECT
+    rf[1] = RF_PWM_CMD
+    rf[2:8] = device_mac
+    rf[8:14] = master_mac
+    rf[14] = clamp_int(target_rx, 0, 255, "target_rx")
+    rf[15] = master_ch
+    rf[16] = clamp_int(target_rx, 0, 255, "target_rx")
+    rf[17:21] = bytes(clamp_int(v, 0, 255, "pwm") for v in current_pwm)
+    return bytes(rf)
+
+
+def cmd_save_config(master_mac: bytes) -> bytes:
+    """Build the broadcast SaveConfig RF frame that persists the new binding."""
+    rf = bytearray(RF_DATA_SIZE)
+    rf[0] = RF_SELECT
+    rf[1] = RF_SAVE_CONFIG
+    rf[2:8] = BROADCAST_MAC
+    rf[8:14] = master_mac
+    rf[14] = BROADCAST_RX
     return bytes(rf)
 
 

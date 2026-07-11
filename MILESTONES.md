@@ -16,7 +16,8 @@ As of 2026-07-01:
 - `doctor.sh` provides one-command health classification.
 - Theme index 5 is selected; theme helper (`set-theme.sh`) is available.
 - Load-test tuning is accepted as good enough for daily use.
-- Replacement display still pending from Lian Li RMA.
+- Replacement display installed and bound (2026-07-11); theme index 5 confirmed
+  rendering cleanly. Firmware version not yet checked — see the RMA guardrails.
 
 ## Milestone 0 — Reverse engineering / proof of concept ✅
 
@@ -324,11 +325,16 @@ Acceptance criteria:
 
 ### 8.3 Optional daemon self-healing ✅ (removed 2026-07-03)
 
-> Removed in the 2026-07-03 simplification pass: auto-rebind, discovery
-> classification, and the in-daemon bind packet were deleted. The supported
-> recovery path is `scripts/recover-display.sh` (which has its own standalone
-> bind implementation in `scripts/recover-display.py`). The section below is
-> kept as a historical record.
+> Removed in the 2026-07-03 simplification pass: auto-rebind and discovery
+> classification (`DiscoveryState`, `classify_discovery()`) were deleted from
+> `daemon.py`. The supported recovery path is `scripts/recover-display.sh`,
+> which imports `cmd_bind_aio()` / `cmd_save_config()` from `daemon.py` — it
+> does **not** have its own standalone bind implementation, correcting an
+> inaccurate note that used to be here. Those two functions (plus
+> `RF_SAVE_CONFIG`, `BROADCAST_MAC`, `BROADCAST_RX`) were briefly deleted along
+> with the rest of the auto-rebind code, which broke `recover-display.py` with
+> an `ImportError`; caught and fixed 2026-07-11 during the replacement-display
+> recovery (see below). The section below is kept as a historical record.
 
 Goal: decide whether the daemon should automatically re-bind in the narrow safe
 case.
@@ -564,6 +570,40 @@ Deliberate code-shrink before the native-app pivot (~1,500 lines deleted, 57 →
 - Original prototype `lianli_daemon_v2.original.py` deleted (preserved in git history).
 - OpenRGB bridge trimmed to Direct mode only (Static mode + mode parsing removed).
 - `stale_targets` inlined into the control loop.
+
+## Replacement display recovery (2026-07-11)
+
+Replacement unit from the RMA arrived and was installed.
+
+- SwiftBar menu-bar plugin's "Run doctor" / "Restart daemon" actions were
+  broken: a hardcoded `open -a Ghostty --args -e ...` doesn't reliably forward
+  `-e` args to an already-running Ghostty instance. Fixed by reverting
+  "Run doctor" to `terminal=true` and moving "Restart daemon" into
+  `scripts/restart-daemon.sh` (native admin-privilege prompt, no terminal
+  window, no fragile inline-quoted AppleScript in the plugin metadata line).
+- `doctor.sh` initially reported `STATUS: UNBOUND` — the new AIO
+  (MAC `03:77:14:50:6c:e1`) was visible but not bound to this Mac's master,
+  the expected state for hardware that has never been paired to this dongle
+  (same shape as the 2026-06-18 incident in Milestone 8).
+- `./scripts/recover-display.sh --dry-run` failed with an `ImportError`:
+  `cmd_bind_aio` / `cmd_save_config` had been deleted from `daemon.py` in the
+  2026-07-03 simplification pass (see corrected 8.3 note above). Restored both
+  functions plus `RF_SAVE_CONFIG`, `BROADCAST_MAC`, `BROADCAST_RX` in
+  `daemon.py`; left the rest of the removed auto-rebind machinery deleted
+  since nothing else calls it. 42 tests still pass.
+- Re-ran `recover-display.sh --dry-run` (confirmed visible-unbound), then
+  `recover-display.sh` for real: bound the AIO to master
+  `f8:06:e4:e5:66:e4` and re-applied theme index 5.
+- Post-recovery `doctor.sh`: `STATUS: HEALTHY` — telemetry 0s old, discovery
+  bound, OpenRGB bridge reachable, RGB frame applied 11s ago. Theme index 5
+  (previously verified safe) renders cleanly on the replacement display.
+
+Still open:
+
+- Firmware version of the replacement unit not yet confirmed. Per the RMA
+  guardrails above, if it differs from `lianli-H2S-1.7`, re-verify the theme
+  range conservatively (one index at a time, never `--scan-themes`) before
+  assuming 0–12 is still safe.
 
 ## Roadmap: native macOS app
 

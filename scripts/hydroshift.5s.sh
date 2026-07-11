@@ -45,7 +45,7 @@ echo "Theme (current ${theme:-?})"
 for n in $(seq 0 12); do
   mark=" "
   [[ "$n" == "${theme:-}" ]] && mark="✓"
-  echo "-- ${mark} ${n} | bash=$PROJECT/scripts/set-theme.sh param1=${n} param2=--reload terminal=true font=Menlo"
+  echo "-- ${mark} ${n} | bash=$PROJECT/scripts/set-theme.sh param1=${n} param2=--reload font=Menlo"
 done
 echo "Run doctor | bash=$PROJECT/scripts/doctor.sh terminal=true"
-echo "Restart daemon | bash=/bin/bash param1=-c param2=\"sudo launchctl kickstart -k system/com.suraj.lianli-hydroshift\" terminal=true"
+echo "Restart daemon | bash=$PROJECT/scripts/restart-daemon.sh"

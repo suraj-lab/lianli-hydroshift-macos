@@ -22,12 +22,10 @@ cd "$PROJECT_DIR"
 .venv/bin/python -m lianli_hydroshift.daemon --config "$CONFIG" --set-theme "$THEME"
 
 if $RELOAD; then
-  echo "Sending SIGHUP to running daemon..."
-  if sudo launchctl kill SIGHUP "system/$LABEL" 2>/dev/null; then
-    echo "Reloaded via launchd."
-  elif pkill -HUP -f 'lianli_hydroshift.daemon' 2>/dev/null; then
-    echo "Reloaded via pkill."
-  else
-    echo "Warning: could not signal running daemon — restart it manually." >&2
-  fi
+  # ponytail: osascript admin dialog instead of terminal+sendo
+  osascript -e "do shell script \"launchctl kill SIGHUP system/$LABEL\" with administrator privileges" 2>/dev/null && exit 0
+  # fallback: try pkill if launchctl isn't available
+  pkill -HUP -f 'lianli_hydroshift.daemon' 2>/dev/null && exit 0
+  echo "Warning: could not signal running daemon — restart it manually." >&2
+  exit 1
 fi
