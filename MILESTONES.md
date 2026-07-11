@@ -15,6 +15,8 @@ As of 2026-07-01:
 - Unbound-AIO recovery is manual via `recover-display.sh` (daemon auto-rebind removed 2026-07-03).
 - `doctor.sh` provides one-command health classification.
 - Theme index 5 is selected; theme helper (`set-theme.sh`) is available.
+- Native menu-bar app `HydroShift.app` (Milestone 9) is built and installed
+  at `/Applications/`; the interim SwiftBar plugin has been retired.
 - Load-test tuning is accepted as good enough for daily use.
 - Replacement display installed and bound (2026-07-11); theme index 5 confirmed
   rendering cleanly. Firmware version not yet checked — see the RMA guardrails.
@@ -604,20 +606,39 @@ Firmware check (2026-07-11):
   re-verification. Serial differs from the original unit's
   (`5047490364c6c701w`), confirming this is genuinely new hardware.
 
-## Roadmap: native macOS app
+## Milestone 9 — native macOS app ✅ (2026-07-11)
 
-Once the replacement display arrives / Lian Li responds, the project pivots from
-a CLI daemon to a proper macOS app. High-level intent (to be planned in detail):
+Status: complete. Replaces the interim SwiftBar plugin (`scripts/hydroshift.5s.sh`,
+unlinked from `~/Documents/SwiftBarPlugins/`) with a proper menu-bar app.
 
-- Menu-bar app surfacing live coolant temp, fan/pump RPM, and theme.
-- Config UI for the fan/pump curves instead of hand-edited config.json.
-- Keep the existing daemon as the control backend; the app talks to it.
-- Safe theme picker constrained to the verified 0–12 range.
+- **`HydroShift.app`** — SwiftPM package at `app/` (no Xcode project; `swift build`
+  + `app/build-app.sh` produces the `.app` bundle), installed at
+  `/Applications/HydroShift.app`. SwiftUI `MenuBarExtra`, `LSUIElement` (no Dock
+  icon). Not auto-started at login — add via System Settings if wanted.
+- **Daemon side**: `save_status()` in `daemon.py` writes `~/.config/lianli-hydroshift/status.json`
+  atomically (tmp + rename) once per control-loop tick (~1Hz) — coolant, fan
+  RPMs, pump target, telemetry state, theme index. This is the only new
+  daemon surface; everything else (config edit + SIGHUP reload, `doctor.sh`)
+  is reused, not reimplemented.
+- **App side** (`app/Sources/`): `Backend.swift` reads `status.json` and
+  `config.json` directly (no socket/IPC — polling a file was enough at 1Hz),
+  writes config as a raw JSON dict (preserves keys the app doesn't know
+  about), and reuses the exact `osascript ... with administrator privileges`
+  pattern from `set-theme.sh`/`restart-daemon.sh` for SIGHUP/restart. `Run
+  Doctor` shells out to the existing `doctor.sh` rather than reimplementing
+  health classification in Swift.
+- **Curve editor**: hand-rolled `Canvas` + `DragGesture` (Swift Charts fights
+  hit-testing for draggable points), with a live coolant marker. Drag-only —
+  no add/remove point UI; the fan curve (12 points) and pump curve (7 points)
+  cover real tuning without it.
+- Theme picker clamps to 0–12 independently in the app (in addition to the
+  daemon's own clamp), since 13+ is the unrecoverable-brick range.
 
-Interim (2026-07-03): `scripts/hydroshift.5s.sh` SwiftBar plugin ships the
-menu-bar essentials now — live coolant/fan/pump from the daemon log, 0–12 theme
-picker via `set-theme.sh`, doctor and restart shortcuts. The full native app
-(curve editor UI) stays gated on the replacement display.
+Deliberately skipped (say so if any of these turns out to matter):
+login-item autostart, proper code signing (ad-hoc only), app icon, pump
+constant-mode UI (config is curve-mode), and a command/status IPC socket
+(the status file covers current needs; add a socket if the app ever needs to
+push commands the config-file-plus-SIGHUP path can't express).
 
 ## Known issues / observations
 
@@ -638,6 +659,7 @@ Daily-driver state is accepted for now:
 
 Next recommended work, in order:
 
-1. Use the system normally and observe logs/noise for a few days; run
-   `./scripts/doctor.sh` if anything looks off.
-2. Continue native macOS app planning (Milestone 9).
+1. Use the system normally (daemon + HydroShift.app) and observe logs/noise
+   for a few days; run `./scripts/doctor.sh` if anything looks off.
+2. No open milestones. Revisit the deliberate skips under Milestone 9 above
+   if a real need for any of them comes up.

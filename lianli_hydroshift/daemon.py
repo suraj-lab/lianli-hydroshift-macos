@@ -978,6 +978,21 @@ def load_rgb_frame(config_path: str) -> list[Color] | None:
         return None
 
 
+def save_status(config_path: str, status: dict[str, Any]) -> None:
+    """Write a live telemetry snapshot next to the config for external UIs.
+
+    Atomic (tmp + rename) because the menu-bar app polls this file at ~1Hz.
+    """
+    path = Path(config_path).parent / "status.json"
+    tmp = path.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(status))
+        os.replace(tmp, path)
+    except OSError as exc:
+        # debug, not warning: a persistent failure would spam at 1Hz
+        LOG.debug("failed to write status file %s: %s", path, exc)
+
+
 def write_default_config(path: str | os.PathLike[str]) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -1477,6 +1492,19 @@ def main(argv: list[str] | None = None) -> int:
                                 raise ReconnectRequested("OpenRGB RGB USB path failed repeatedly") from exc
                         except Exception as exc:
                             LOG.warning("OpenRGB RGB send failed: %s", exc)
+
+                save_status(args.config, {
+                    "ts": time.time(),
+                    "coolant_c": last_coolant,
+                    "raw_coolant_c": last_raw_coolant,
+                    "stale_s": round(stale_age, 1),
+                    "telemetry": telemetry_state,
+                    "failsafe": failsafe,
+                    "fan_pwm": target_pwm,
+                    "pump_target_rpm": pump_rpm,
+                    "rpm": last_tel["fan_rpms"] if last_tel else [0, 0, 0, 0],
+                    "theme_index": cfg["theme_index"],
+                })
 
                 if time.time() - last_log >= cfg["log_interval_s"]:
                     rpm = last_tel["fan_rpms"] if last_tel else [0, 0, 0, 0]

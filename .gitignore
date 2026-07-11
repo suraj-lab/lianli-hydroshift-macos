@@ -11,3 +11,5 @@ lianli_hydroshift/libtinyuz.dylib
 lianli_hydroshift/libtinyuz.so
 config/config.json
 .generated.*.plist
+app/.build/
+app/HydroShift.app/
