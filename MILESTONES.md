@@ -151,42 +151,38 @@ Accepted behavior:
 - No hard-stale/full-blast behavior in the final accepted run.
 - User reported remaining ramp as acceptable.
 
-## Milestone 5 — Theme discovery ⏳
+## Milestone 5 — Theme discovery ✅ (closed as won't-do, 2026-07-11)
 
-Status: helper tooling done; systematic scan not yet run.
+Status: closed. Helper tooling done; systematic scan deliberately skipped.
 
 Known:
 
-- `theme_index = 5` currently selected.
+- `theme_index = 5` currently selected and kept — looks distinct running under
+  macOS, no reason to change it.
 - Valid range confirmed as 0–12. Indexes 13+ corrupt the device display state
-  and require a physical USB dongle replug to recover. `theme_index_max` is now
-  hard-clamped to 12 in the daemon.
+  and require a physical USB dongle replug to recover. `theme_index_max` is
+  hard-clamped to 12 in the daemon. Independently corroborated by the
+  `sgtaziz/lian-li-linux` reference project, which hardcodes the same `0..=12`
+  range in its own theme picker (generic "Theme N" labels, no descriptions —
+  confirming there's no documented catalog of what each index looks like,
+  anywhere).
+- Firmware confirmed unchanged from the original unit (`lianli-H2S-1.7`, see
+  the 2026-07-11 replacement recovery section below), so this range still
+  applies to the replacement display without re-verification.
 
 Completed:
 
 - `--set-theme N` CLI flag: updates `theme_index` in config.json and exits. Clamps to `theme_index_max`.
 - `scripts/set-theme.sh <N> [--reload]`: convenience wrapper; `--reload` sends SIGHUP to the running daemon so the change takes effect without a full restart.
 
-Next tasks:
-
-- Document themes using **one index at a time** — do **not** use `--scan-themes`
-  (that range walk is what probed the unsafe index 13 on the original display):
-
-```bash
-./scripts/set-theme.sh N --reload
-```
-
-- Record visible behavior per index:
-  - valid / invalid
-  - appearance
-  - whether it affects LCD/pump head
-  - brightness/rotation interactions
-- Add `docs/themes.md` once mapped.
-- Switch to a discovered theme using the new helper:
-
-```bash
-./scripts/set-theme.sh 7 --reload
-```
+Decision (2026-07-11): not cataloguing the remaining 12 indexes. There is no
+way to preview a theme before switching to it, and the 2026-06-04 incident
+showed the failure mode (13+) is unrecoverable in software — probing indexes
+1–12 individually is technically inside the verified-safe range, but the
+user has no interest in the risk for indexes they can't preview and have no
+need for. `theme_index = 5` stays. `docs/themes.md` will not be written
+unless a future need for a different theme comes up — one index at a time via
+`set-theme.sh N --reload` and never `--scan-themes` still applies if it does.
 
 ## Milestone 6 — Packaging / hardening ✅
 
@@ -598,12 +594,15 @@ Replacement unit from the RMA arrived and was installed.
   bound, OpenRGB bridge reachable, RGB frame applied 11s ago. Theme index 5
   (previously verified safe) renders cleanly on the replacement display.
 
-Still open:
+Firmware check (2026-07-11):
 
-- Firmware version of the replacement unit not yet confirmed. Per the RMA
-  guardrails above, if it differs from `lianli-H2S-1.7`, re-verify the theme
-  range conservatively (one index at a time, never `--scan-themes`) before
-  assuming 0–12 is still safe.
+- Read via non-invasive USB string descriptors (`dev.product`/`dev.serial_number`
+  on the `1cbe:a034` LCD identity, no interface claimed): `product='lianli-H2S-1.7'`,
+  `serial='37308f2250af8205w'`.
+- Same firmware string as the original unit — not newer — so per the RMA
+  guardrail the already-verified 0–12 theme range still applies without extra
+  re-verification. Serial differs from the original unit's
+  (`5047490364c6c701w`), confirming this is genuinely new hardware.
 
 ## Roadmap: native macOS app
 
@@ -641,7 +640,4 @@ Next recommended work, in order:
 
 1. Use the system normally and observe logs/noise for a few days; run
    `./scripts/doctor.sh` if anything looks off.
-2. Catalogue safe theme indexes only within the verified 0–12 range, one index
-   at a time with `--set-theme N --reload`. Do **not** run `--scan-themes`.
-3. Harden install location (Milestone 6) if this becomes permanent.
-4. Continue native macOS app planning (Milestone 9).
+2. Continue native macOS app planning (Milestone 9).
